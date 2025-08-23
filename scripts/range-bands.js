@@ -1,6 +1,5 @@
-// Range Bands Ruler — v1.4.1
-// Instance-patch approach for Foundry v10–v12 (and v13+).
-// No libWrapper required for the label swap. Keeps module settings.
+// Range Bands Ruler — v1.4.2
+// Instance-patch approach for Foundry v10–v12 (and v13+). No libWrapper required.
 
 const MODULE_ID = "range-bands-ruler";
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
@@ -50,8 +49,8 @@ function getBands() {
   }
 }
 function bandFor(d) {
-  for (const b of getBands()) if (d >= b.min && d <= b.max) return b.label;
   const arr = getBands();
+  for (const b of arr) if (d >= b.min && d <= b.max) return b.label;
   return arr.length ? arr[arr.length - 1].label : String(d);
 }
 function makeLabel(d, base) {
@@ -68,29 +67,45 @@ function parseNum(text) {
   return m ? Number(m[1]) : 0;
 }
 
-/** Replace text of existing labels using segment distances when available. */
+/* ---------------------- PATCHED AREA: robust label access ---------------------- */
+
+/** Get an array of label display objects regardless of how the ruler stores them. */
+function getLabelNodes(ctx) {
+  // Common cases: array, PIXI.Container, or tooltips container
+  if (Array.isArray(ctx?.labels)) return ctx.labels;
+  if (ctx?.labels?.children && Array.isArray(ctx.labels.children)) return ctx.labels.children;
+  if (Array.isArray(ctx?.tooltips)) return ctx.tooltips;
+  if (ctx?.tooltips?.children && Array.isArray(ctx.tooltips.children)) return ctx.tooltips.children;
+  return [];
+}
+
+/** Replace label texts using segment distances when available. */
 function postProcessLabels(ctx) {
   if (!shouldBand(ctx)) return;
 
-  const labels = ctx?.labels ?? ctx?.tooltips ?? [];
-  const segs   = ctx?.segments ?? [];
+  const labelNodes = getLabelNodes(ctx);
+  const segs       = Array.isArray(ctx?.segments) ? ctx.segments : [];
 
-  if (labels.length && segs.length && labels.length === segs.length) {
-    for (let i = 0; i < labels.length; i++) {
-      const lab = labels[i];
-      if (!lab || typeof lab.text !== "string") continue;
-      const d = segs[i]?.distance ?? parseNum(lab.text);
+  // 1: 1:1 mapping with segments
+  if (labelNodes.length && segs.length && labelNodes.length === segs.length) {
+    for (let i = 0; i < labelNodes.length; i++) {
+      const lab = labelNodes[i];
+      const hasText = lab && typeof lab.text === "string";
+      if (!hasText) continue;
+      const d = (segs[i]?.distance ?? parseNum(lab.text)) || 0;
       lab.text = makeLabel(d, lab.text);
     }
     return;
   }
 
-  for (const lab of labels) {
+  // 2: Fallback—parse numeric from each label's current text
+  for (const lab of labelNodes) {
     if (!lab || typeof lab.text !== "string") continue;
     const d = parseNum(lab.text);
     lab.text = makeLabel(d, lab.text);
   }
 }
+/* ----------------------------------------------------------------------------- */
 
 /** Patch a single ruler instance (idempotent). */
 function patchRulerInstance(ruler) {
@@ -145,12 +160,8 @@ Hooks.on("updateUser", () => tryPatchCurrentRuler());
 Hooks.on("controlToken", () => tryPatchCurrentRuler());
 Hooks.on("renderSceneControls", () => tryPatchCurrentRuler());
 
-// Expose a tiny API without optional-chaining on the LHS (avoid syntax errors)
+// Expose a tiny API
 Hooks.once("ready", () => {
   const mod = game.modules.get(MODULE_ID);
-  if (mod) {
-    mod.api = {
-      repatch: () => tryPatchCurrentRuler()
-    };
-  }
+  if (mod) mod.api = { repatch: () => tryPatchCurrentRuler() };
 });
