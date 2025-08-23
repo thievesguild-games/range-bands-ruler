@@ -1,9 +1,9 @@
-// Range Bands Ruler — v1.3.0
-// Broad-compat fallback for Foundry v10–v12 (and v13+).
-// Requires libWrapper. Tries multiple update/refresh methods and post-processes labels.
+// Range Bands Ruler — v1.4.0
+// Instance-patch approach for maximal compatibility on v10–v12 (and v13+).
+// No libWrapper needed for the label swap. Keeps module settings.
 
 const MODULE_ID = "range-bands-ruler";
-const gp = (o, p) => foundry.utils.getProperty(o, p);
+const gp = (o, p) => foundry.utils?.getProperty?.(o, p);
 
 const DEFAULT_BANDS = [
   { label: "Contact", min: 0,  max: 1 },
@@ -17,6 +17,7 @@ const DEFAULT_BANDS = [
 Hooks.once("init", () => {
   game.settings.register(MODULE_ID, "bands", {
     name: "Range Bands",
+    hint: "JSON array of {label,min,max} in scene units.",
     scope: "world",
     config: true,
     default: JSON.stringify(DEFAULT_BANDS, null, 2),
@@ -38,13 +39,13 @@ Hooks.once("init", () => {
   });
 });
 
-function bands() {
+function getBands() {
   try { const a = JSON.parse(game.settings.get(MODULE_ID, "bands")); return Array.isArray(a) ? a : DEFAULT_BANDS; }
   catch { return DEFAULT_BANDS; }
 }
 function bandFor(d) {
-  for (const b of bands()) if (d >= b.min && d <= b.max) return b.label;
-  const a = bands(); return a.length ? a[a.length - 1].label : String(d);
+  for (const b of getBands()) if (d >= b.min && d <= b.max) return b.label;
+  const arr = getBands(); return arr.length ? arr[arr.length - 1].label : String(d);
 }
 function makeLabel(d, base) {
   return game.settings.get(MODULE_ID, "showNumericFallback") && base
@@ -60,14 +61,14 @@ function parseNum(text) {
   return m ? Number(m[1]) : 0;
 }
 
-/** Replace label texts with our band text using segment distances when we can. */
+/** Replace text of existing labels using segment distances when available. */
 function postProcessLabels(ctx) {
   if (!shouldBand(ctx)) return;
 
   const labels = ctx?.labels ?? ctx?.tooltips ?? [];
   const segs   = ctx?.segments ?? [];
 
-  // Try 1: one label per segment
+  // If labels correspond to segments, use segment distance
   if (labels.length && segs.length && labels.length === segs.length) {
     for (let i = 0; i < labels.length; i++) {
       const lab = labels[i];
@@ -78,7 +79,7 @@ function postProcessLabels(ctx) {
     return;
   }
 
-  // Try 2: labels without matching segments -> parse numeric
+  // Otherwise, parse numeric from label text
   for (const lab of labels) {
     if (!lab || typeof lab.text !== "string") continue;
     const d = parseNum(lab.text);
@@ -86,50 +87,59 @@ function postProcessLabels(ctx) {
   }
 }
 
-Hooks.once("ready", () => {
-  console.log(`${MODULE_ID} | Foundry version:`, game.version, "release gen:", gp(game, "release.generation"));
+/** Patch a single ruler instance (idempotent). */
+function patchRulerInstance(ruler) {
+  if (!ruler || ruler._rbrPatched) return false;
 
-  if (!game.modules.get("lib-wrapper")?.active) {
-    ui.notifications?.warn("Range Bands Ruler requires libWrapper.");
-    return;
-  }
-  const lw = globalThis.libWrapper;
-
-  // Active ruler class (systems can override this)
-  const RulerClass = gp(CONFIG, "Canvas.rulerClass") ?? globalThis.Ruler;
-  const className  = RulerClass?.name || "Ruler";
-  console.log(`${MODULE_ID} | Active ruler class: ${className}`);
-
-  // Dump prototype so we can see what's available on your build
-  try {
-    const names = Object.getOwnPropertyNames(RulerClass.prototype).filter(n => typeof RulerClass.prototype[n] === "function");
-    console.log(`${MODULE_ID} | Ruler proto methods:`, names.sort());
-  } catch { /* ignore */ }
-
-  // Candidate methods that run whenever the ruler updates/redraws. We’ll wrap the first we find.
-  const candidates = [
-    "_refreshTooltips", "_refreshLabels", "refresh", "render", "_render", "draw", "_draw",
-    "measure", "_measure", "_update", "update", "_onMouseMove", "_onDragMove"
-  ];
-
-  let hooked = false;
-  for (const m of candidates) {
-    const path = `${className}.prototype.${m}`;
-    const exists = !!gp(globalThis, path);
-    console.log(`${MODULE_ID} | ${exists ? "Hooking" : "Missing"} ${path}`);
-    if (!exists) continue;
-
-    lw.register(MODULE_ID, path, function (wrapped, ...args) {
-      const out = wrapped(...args);
-      try { postProcessLabels(this); } catch (e) { console.warn(`${MODULE_ID} | postProcessLabels failed`, e); }
+  // Prefer tooltip refresher if present
+  if (typeof ruler._refreshTooltips === "function") {
+    const orig = ruler._refreshTooltips.bind(ruler);
+    ruler._refreshTooltips = function(...args) {
+      const out = orig(...args);
+      try { postProcessLabels(this); } catch (e) { console.warn(`${MODULE_ID} | _refreshTooltips patch failed`, e); }
       return out;
-    }, "WRAPPER");
-
-    hooked = true;
-    break;
+    };
+    ruler._rbrPatched = true;
+    console.log(`${MODULE_ID} | Patched instance via _refreshTooltips`);
+    return true;
   }
 
-  if (!hooked) {
-    ui.notifications?.warn("Range Bands Ruler: Could not find a ruler update method to hook; module inactive.");
+  // Fallback: wrap measure
+  if (typeof ruler.measure === "function") {
+    const orig = ruler.measure.bind(ruler);
+    ruler.measure = function(...args) {
+      const out = orig(...args);
+      try { postProcessLabels(this); } catch (e) { console.warn(`${MODULE_ID} | measure patch failed`, e); }
+      return out;
+    };
+    ruler._rbrPatched = true;
+    console.log(`${MODULE_ID} | Patched instance via measure`);
+    return true;
   }
+
+  console.warn(`${MODULE_ID} | Could not find a method to patch on this ruler instance.`);
+  return false;
+}
+
+/** Try to find and patch the current user's ruler instance. */
+function tryPatchCurrentRuler() {
+  const r = gp(canvas, "controls.ruler") || gp(canvas, "hud.ruler") || gp(ui, "controls.controls.ruler") || game.ruler;
+  if (r) patchRulerInstance(r);
+}
+
+// Patch on initial canvas ready, and whenever the scene/canvas changes.
+Hooks.on("canvasReady", () => {
+  console.log(`${MODULE_ID} | canvasReady — attempting instance patch`);
+  tryPatchCurrentRuler();
 });
+
+// Some systems (or reconnects) recreate the ruler later; keep trying on a few lifecycle hooks.
+Hooks.on("updateUser", () => tryPatchCurrentRuler());
+Hooks.on("controlToken", () => tryPatchCurrentRuler());
+Hooks.on("renderSceneControls", () => tryPatchCurrentRuler());
+Hooks.on("hotbarDrop", () => tryPatchCurrentRuler());
+
+// Debug helper (optional): command to re-patch on demand
+game.modules?.get(MODULE_ID)?.api = {
+  repatch: () => tryPatchCurrentRuler()
+};
