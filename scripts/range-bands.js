@@ -1,16 +1,9 @@
-// Range Bands Ruler — v1.0.0
-// Works on Foundry VTT v11+ (tested on v11). Requires libWrapper.
-// Replaces the ruler's distance label with a band (e.g., Close, Near, Far) using user-configurable thresholds.
+// Range Bands Ruler — v1.2.0
+// One file to support Foundry v10–v12 and v13+
+// Requires libWrapper. Shows configurable range bands on the ruler.
 
 const MODULE_ID = "range-bands-ruler";
 
-/** Default band spec:
- * Each band has:
- *  - label: string shown on the ruler
- *  - min: inclusive lower bound in scene units (0 = start)
- *  - max: inclusive upper bound in scene units
- * Order matters (first match wins).
- */
 const DEFAULT_BANDS = [
   { label: "Contact", min: 0,  max: 1 },
   { label: "Close",   min: 1,  max: 5 },
@@ -20,28 +13,26 @@ const DEFAULT_BANDS = [
   { label: "Extreme", min: 121, max: 999999 }
 ];
 
-Hooks.once("init", async () => {
+Hooks.once("init", () => {
   game.settings.register(MODULE_ID, "bands", {
     name: "Range Bands",
-    hint: "Define your range bands in scene units as JSON array. Example provided.",
+    hint: "JSON array of {label,min,max} in scene distance units.",
     scope: "world",
     config: true,
     default: JSON.stringify(DEFAULT_BANDS, null, 2),
     type: String
   });
-
   game.settings.register(MODULE_ID, "showNumericFallback", {
-    name: "Show Numeric in Tooltip",
-    hint: "Also include the numeric distance (system units) in the ruler tooltip in parentheses.",
+    name: "Show Numeric in Parentheses",
+    hint: "Append the numeric distance after the band label.",
     scope: "client",
     config: true,
     default: true,
     type: Boolean
   });
-
   game.settings.register(MODULE_ID, "bandWhenSnappedOnly", {
-    name: "Only Band When Snapped",
-    hint: "If enabled, show bands only when ruler is snapped to grid; otherwise always show bands.",
+    name: "Only Show Bands When Snapped",
+    hint: "If enabled, only show bands when the ruler is snapped to grid.",
     scope: "client",
     config: true,
     default: false,
@@ -49,110 +40,120 @@ Hooks.once("init", async () => {
   });
 });
 
-/** Parse user bands safely */
 function getBands() {
   try {
-    const raw = game.settings.get(MODULE_ID, "bands");
-    const arr = JSON.parse(raw);
+    const arr = JSON.parse(game.settings.get(MODULE_ID, "bands"));
     if (!Array.isArray(arr)) throw new Error("Bands must be an array");
-    // Normalize & validate
     return arr.map(b => ({
-      label: String(b.label ?? ""),
-      min: Number.isFinite(+b.min) ? +b.min : 0,
-      max: Number.isFinite(+b.max) ? +b.max : 0
-    })).filter(b => b.label && b.max >= b.min);
+      label: String(b.label ?? "").trim(),
+      min: Number(b.min ?? 0),
+      max: Number(b.max ?? 0)
+    })).filter(b => b.label && isFinite(b.min) && isFinite(b.max) && b.max >= b.min);
   } catch (e) {
-    console.warn(`${MODULE_ID} | Invalid bands config, using defaults.`, e);
+    console.warn(`${MODULE_ID} | Invalid bands config; using defaults.`, e);
     return DEFAULT_BANDS;
   }
 }
 
-/** Find band by distance (scene distance, not pixels) */
 function bandForDistance(d) {
   const bands = getBands();
-  for (const b of bands) {
-    if (d >= b.min && d <= b.max) return b.label;
-  }
-  // If nothing matched, fall back to the last band
-  return bands.length ? bands[bands.length - 1].label : `${d}`;
+  for (const b of bands) if (d >= b.min && d <= b.max) return b.label;
+  return bands.length ? bands[bands.length - 1].label : String(d);
 }
-
-/** Produce final label text given a numeric distance and ruler state */
-function bandLabel(distance, baseText) {
+function makeBandLabel(distance, baseText) {
   const showNum = game.settings.get(MODULE_ID, "showNumericFallback");
   const label = bandForDistance(distance);
-  if (showNum && baseText) return `${label} (${baseText})`;
-  return label;
+  return (showNum && baseText) ? `${label} (${baseText})` : label;
+}
+function shouldBand(ruler) {
+  const onlySnapped = game.settings.get(MODULE_ID, "bandWhenSnappedOnly");
+  if (!onlySnapped) return true;
+  return Boolean(ruler?.snapped ?? true);
 }
 
-/**
- * Foundry internal changes over versions make direct method names fragile.
- * We'll use libWrapper to safely override two likely points:
- * 1) Ruler.prototype._getSegmentLabel (v11) – returns the text shown for each segment
- * 2) Ruler.prototype._getRulerText / _getMeasurementText (fallbacks)
- */
+// Extract a numeric distance from common call-sites / contexts
+function extractDistance(ctx, args, base) {
+  if (typeof args?.[0] === "number" && isFinite(args[0])) return args[0];  // _getSegmentLabel(distance,...)
+  const seg = ctx?.segments?.at?.(-1);
+  if (seg?.distance) return seg.distance;
+  if (typeof ctx?.totalDistance === "number") return ctx.totalDistance;
+  if (typeof base === "number") return base;
+  if (typeof base === "string") {
+    const m = base.match(/(\d+(?:\.\d+)?)/);
+    if (m) return Number(m[1]);
+  }
+  return 0;
+}
+
 Hooks.once("ready", () => {
   if (!game.modules.get("lib-wrapper")?.active) {
-    ui.notifications?.warn("Range Bands Ruler: libWrapper is not active. The module may not work.");
+    ui.notifications?.warn("Range Bands Ruler: libWrapper is not active. Labels may not change.");
+    return;
   }
-
-  // Helper function to decide if we should show bands
-  function shouldBand(rulerInstance) {
-    const onlyWhenSnapped = game.settings.get(MODULE_ID, "bandWhenSnappedOnly");
-    if (!onlyWhenSnapped) return true;
-    // Ruler has .snapped property in v11 when Shift not held, etc. Fallback to true if undefined.
-    return Boolean(rulerInstance?.snapped ?? true);
-  }
-
-  /** Wrapper that converts the label to band text */
-  function labelWrapper(wrapped, ...args) {
-    try {
-      const text = wrapped(...args);                // original text like "30 ft"
-      const ctx = this;                             // ruler instance
-      // Find distance in scene units. In v11, the wrapper is Ruler._getSegmentLabel(distance, opts)
-      // But we cannot rely on args shape; derive from existing text via measure segments if needed.
-      // Prefer this.segmentDistance if available (v11 stores last segment length).
-      let distance = 0;
-      if (typeof args[0] === "number") distance = args[0];
-      else if (ctx?.segments?.length) {
-        const seg = ctx.segments.at(-1);
-        distance = seg?.distance ?? 0;
-      } else if (ctx?.totalDistance) distance = ctx.totalDistance;
-
-      if (!shouldBand(ctx)) return text;
-
-      return bandLabel(distance, text);
-    } catch (err) {
-      console.warn(`${MODULE_ID} | labelWrapper error`, err);
-      return wrapped(...args);
-    }
-  }
-
-  // Try to wrap the most stable method first.
   const lw = globalThis.libWrapper;
-  let wrappedSomething = false;
 
-  // v11 target
+  // Detect major version: v13+ exposes game.release?.generation
+  const major = Number(getProperty(game, "release.generation")) || (function () {
+    // Fallback: parse game.version "12.x.x"
+    const v = String(game.version ?? "").match(/^(\d+)/);
+    return v ? Number(v[1]) : 12;
+  })();
+
+  // --- v10–v12 primary hook: _getSegmentLabel(distance, opts) ---
   if (getProperty(globalThis, "Ruler.prototype._getSegmentLabel")) {
-    lw.register(MODULE_ID, "Ruler.prototype._getSegmentLabel", labelWrapper, "WRAPPER");
-    wrappedSomething = true;
+    lw.register(MODULE_ID, "Ruler.prototype._getSegmentLabel", function (wrapped, ...args) {
+      const base = wrapped(...args); // "60 ft"
+      if (!shouldBand(this)) return base;
+      const dist = extractDistance(this, args, base);
+      return makeBandLabel(dist, base);
+    }, "WRAPPER");
   }
 
-  // Fallbacks
-  if (!wrappedSomething && getProperty(globalThis, "Ruler.prototype._getRulerText")) {
-    lw.register(MODULE_ID, "Ruler.prototype._getRulerText", labelWrapper, "WRAPPER");
-    wrappedSomething = true;
+  // Fallbacks seen in some v10/11 builds
+  if (getProperty(globalThis, "Ruler.prototype._getRulerText")) {
+    lw.register(MODULE_ID, "Ruler.prototype._getRulerText", function (wrapped, ...args) {
+      const base = wrapped(...args);
+      if (!shouldBand(this)) return base;
+      const dist = extractDistance(this, args, base);
+      return makeBandLabel(dist, base);
+    }, "WRAPPER");
+  }
+  if (getProperty(globalThis, "Ruler.prototype._getMeasurementText")) {
+    lw.register(MODULE_ID, "Ruler.prototype._getMeasurementText", function (wrapped, ...args) {
+      const base = wrapped(...args);
+      if (!shouldBand(this)) return base;
+      const dist = extractDistance(this, args, base);
+      return makeBandLabel(dist, base);
+    }, "WRAPPER");
   }
 
-  if (!wrappedSomething && getProperty(globalThis, "Ruler.prototype._getMeasurementText")) {
-    lw.register(MODULE_ID, "Ruler.prototype._getMeasurementText", labelWrapper, "WRAPPER");
-    wrappedSomething = true;
+  // --- v13+ formatter: _formatDistance(distance, opts) ---
+  if (major >= 13 && getProperty(globalThis, "Ruler.prototype._formatDistance")) {
+    lw.register(MODULE_ID, "Ruler.prototype._formatDistance", function (wrapped, distance, ...rest) {
+      const base = wrapped(distance, ...rest); // "60 ft"
+      if (!shouldBand(this)) return base;
+      return makeBandLabel(distance, base);
+    }, "WRAPPER");
   }
 
-  if (!wrappedSomething) {
-    console.warn(`${MODULE_ID} | Could not find a ruler label method to wrap. Module may need an update for your Foundry version.`);
-    ui.notifications?.warn("Range Bands Ruler could not patch the ruler on this Foundry version.");
+  // Ultimate fallback across versions: post-process tooltips after they are built
+  if (getProperty(globalThis, "Ruler.prototype._refreshTooltips")) {
+    lw.register(MODULE_ID, "Ruler.prototype._refreshTooltips", function (wrapped, ...args) {
+      const out = wrapped(...args);
+      try {
+        if (!shouldBand(this)) return out;
+        const labels = this?.labels ?? this?.tooltips ?? [];
+        for (const lab of labels) {
+          if (!lab || typeof lab.text !== "string") continue;
+          const d = (lab?.segment?.distance) ?? extractDistance(this, undefined, lab.text);
+          lab.text = makeBandLabel(d, lab.text);
+        }
+      } catch (e) {
+        console.warn(`${MODULE_ID} | tooltip post-process failed`, e);
+      }
+      return out;
+    }, "WRAPPER");
   }
 
-  console.log(`${MODULE_ID} | Ready.`);
+  console.log(`${MODULE_ID} | Range band wrappers registered for v${major}.`);
 });
