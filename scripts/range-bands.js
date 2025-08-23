@@ -1,4 +1,4 @@
-// Range Bands Ruler — v1.4.2
+// Range Bands Ruler — v1.4.3
 // Instance-patch approach for Foundry v10–v12 (and v13+). No libWrapper required.
 
 const MODULE_ID = "range-bands-ruler";
