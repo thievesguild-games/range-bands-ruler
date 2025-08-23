@@ -79,31 +79,42 @@ function getLabelNodes(ctx) {
   return [];
 }
 
+// Add this helper (anywhere above postProcessLabels)
+function getLabelNodes(ctx) {
+  if (Array.isArray(ctx?.labels)) return ctx.labels;
+  if (ctx?.labels?.children && Array.isArray(ctx.labels.children)) return ctx.labels.children;
+  if (Array.isArray(ctx?.tooltips)) return ctx.tooltips;
+  if (ctx?.tooltips?.children && Array.isArray(ctx.tooltips.children)) return ctx.tooltips.children;
+  return [];
+}
+
 /** Replace label texts using segment distances when available. */
 function postProcessLabels(ctx) {
   if (!shouldBand(ctx)) return;
 
   const labelNodes = getLabelNodes(ctx);
-  const segs       = Array.isArray(ctx?.segments) ? ctx.segments : [];
+  const segs = Array.isArray(ctx?.segments) ? ctx.segments : [];
 
-  // 1: 1:1 mapping with segments
+  // Build from the label's ORIGINAL text (first seen), not whatever we wrote last time
+  const build = (lab, segDist) => {
+    if (!lab || typeof lab.text !== "string") return;
+    if (lab._rbrOriginal === undefined) lab._rbrOriginal = lab.text;      // cache first-seen text
+    const base = lab._rbrOriginal;                                       // always start from original numeric
+    const d = (segDist ?? parseNum(base)) || 0;
+    lab.text = makeLabel(d, base);
+  };
+
+  // 1: 1–to–1 labels ⇄ segments
   if (labelNodes.length && segs.length && labelNodes.length === segs.length) {
     for (let i = 0; i < labelNodes.length; i++) {
       const lab = labelNodes[i];
-      const hasText = lab && typeof lab.text === "string";
-      if (!hasText) continue;
-      const d = (segs[i]?.distance ?? parseNum(lab.text)) || 0;
-      lab.text = makeLabel(d, lab.text);
+      build(lab, segs[i]?.distance);
     }
     return;
   }
 
-  // 2: Fallback—parse numeric from each label's current text
-  for (const lab of labelNodes) {
-    if (!lab || typeof lab.text !== "string") continue;
-    const d = parseNum(lab.text);
-    lab.text = makeLabel(d, lab.text);
-  }
+  // 2: Fallback—parse from original text
+  for (const lab of labelNodes) build(lab, undefined);
 }
 /* ----------------------------------------------------------------------------- */
 
