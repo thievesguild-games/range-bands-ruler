@@ -1,9 +1,9 @@
-// Range Bands Ruler — v1.4.0
-// Instance-patch approach for maximal compatibility on v10–v12 (and v13+).
-// No libWrapper needed for the label swap. Keeps module settings.
+// Range Bands Ruler — v1.4.1
+// Instance-patch approach for Foundry v10–v12 (and v13+).
+// No libWrapper required for the label swap. Keeps module settings.
 
 const MODULE_ID = "range-bands-ruler";
-const gp = (o, p) => foundry.utils?.getProperty?.(o, p);
+const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
 
 const DEFAULT_BANDS = [
   { label: "Contact", min: 0,  max: 1 },
@@ -25,6 +25,7 @@ Hooks.once("init", () => {
   });
   game.settings.register(MODULE_ID, "showNumericFallback", {
     name: "Show Numeric in Parentheses",
+    hint: "Append the numeric distance after the band label.",
     scope: "client",
     config: true,
     default: true,
@@ -32,6 +33,7 @@ Hooks.once("init", () => {
   });
   game.settings.register(MODULE_ID, "bandWhenSnappedOnly", {
     name: "Only Show Bands When Snapped",
+    hint: "If enabled, only show bands when the ruler is snapped to grid.",
     scope: "client",
     config: true,
     default: false,
@@ -40,12 +42,17 @@ Hooks.once("init", () => {
 });
 
 function getBands() {
-  try { const a = JSON.parse(game.settings.get(MODULE_ID, "bands")); return Array.isArray(a) ? a : DEFAULT_BANDS; }
-  catch { return DEFAULT_BANDS; }
+  try {
+    const a = JSON.parse(game.settings.get(MODULE_ID, "bands"));
+    return Array.isArray(a) ? a : DEFAULT_BANDS;
+  } catch {
+    return DEFAULT_BANDS;
+  }
 }
 function bandFor(d) {
   for (const b of getBands()) if (d >= b.min && d <= b.max) return b.label;
-  const arr = getBands(); return arr.length ? arr[arr.length - 1].label : String(d);
+  const arr = getBands();
+  return arr.length ? arr[arr.length - 1].label : String(d);
 }
 function makeLabel(d, base) {
   return game.settings.get(MODULE_ID, "showNumericFallback") && base
@@ -68,7 +75,6 @@ function postProcessLabels(ctx) {
   const labels = ctx?.labels ?? ctx?.tooltips ?? [];
   const segs   = ctx?.segments ?? [];
 
-  // If labels correspond to segments, use segment distance
   if (labels.length && segs.length && labels.length === segs.length) {
     for (let i = 0; i < labels.length; i++) {
       const lab = labels[i];
@@ -79,7 +85,6 @@ function postProcessLabels(ctx) {
     return;
   }
 
-  // Otherwise, parse numeric from label text
   for (const lab of labels) {
     if (!lab || typeof lab.text !== "string") continue;
     const d = parseNum(lab.text);
@@ -94,7 +99,7 @@ function patchRulerInstance(ruler) {
   // Prefer tooltip refresher if present
   if (typeof ruler._refreshTooltips === "function") {
     const orig = ruler._refreshTooltips.bind(ruler);
-    ruler._refreshTooltips = function(...args) {
+    ruler._refreshTooltips = function (...args) {
       const out = orig(...args);
       try { postProcessLabels(this); } catch (e) { console.warn(`${MODULE_ID} | _refreshTooltips patch failed`, e); }
       return out;
@@ -107,7 +112,7 @@ function patchRulerInstance(ruler) {
   // Fallback: wrap measure
   if (typeof ruler.measure === "function") {
     const orig = ruler.measure.bind(ruler);
-    ruler.measure = function(...args) {
+    ruler.measure = function (...args) {
       const out = orig(...args);
       try { postProcessLabels(this); } catch (e) { console.warn(`${MODULE_ID} | measure patch failed`, e); }
       return out;
@@ -123,23 +128,29 @@ function patchRulerInstance(ruler) {
 
 /** Try to find and patch the current user's ruler instance. */
 function tryPatchCurrentRuler() {
-  const r = gp(canvas, "controls.ruler") || gp(canvas, "hud.ruler") || gp(ui, "controls.controls.ruler") || game.ruler;
+  const r =
+    gp(canvas, "controls.ruler") ||
+    gp(canvas, "hud.ruler") ||
+    game.ruler ||
+    gp(ui, "controls.controls.ruler");
   if (r) patchRulerInstance(r);
 }
 
-// Patch on initial canvas ready, and whenever the scene/canvas changes.
+// Patch when the canvas is ready and on a few lifecycle hooks in case the ruler is recreated.
 Hooks.on("canvasReady", () => {
   console.log(`${MODULE_ID} | canvasReady — attempting instance patch`);
   tryPatchCurrentRuler();
 });
-
-// Some systems (or reconnects) recreate the ruler later; keep trying on a few lifecycle hooks.
 Hooks.on("updateUser", () => tryPatchCurrentRuler());
 Hooks.on("controlToken", () => tryPatchCurrentRuler());
 Hooks.on("renderSceneControls", () => tryPatchCurrentRuler());
-Hooks.on("hotbarDrop", () => tryPatchCurrentRuler());
 
-// Debug helper (optional): command to re-patch on demand
-game.modules?.get(MODULE_ID)?.api = {
-  repatch: () => tryPatchCurrentRuler()
-};
+// Expose a tiny API without optional-chaining on the LHS (avoid syntax errors)
+Hooks.once("ready", () => {
+  const mod = game.modules.get(MODULE_ID);
+  if (mod) {
+    mod.api = {
+      repatch: () => tryPatchCurrentRuler()
+    };
+  }
+});
