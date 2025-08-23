@@ -1,8 +1,10 @@
-// Range Bands Ruler — v1.2.0
-// One file to support Foundry v10–v12 and v13+
-// Requires libWrapper. Shows configurable range bands on the ruler.
+// Range Bands Ruler — v1.3.0
+// Supports Foundry v10–v13+. Requires libWrapper.
+// Shows configurable range bands on the ruler labels.
 
 const MODULE_ID = "range-bands-ruler";
+
+/* ----------------------------- Settings ----------------------------- */
 
 const DEFAULT_BANDS = [
   { label: "Contact", min: 0,  max: 1 },
@@ -40,6 +42,8 @@ Hooks.once("init", () => {
   });
 });
 
+/* ----------------------------- Helpers ----------------------------- */
+
 function getBands() {
   try {
     const arr = JSON.parse(game.settings.get(MODULE_ID, "bands"));
@@ -60,11 +64,13 @@ function bandForDistance(d) {
   for (const b of bands) if (d >= b.min && d <= b.max) return b.label;
   return bands.length ? bands[bands.length - 1].label : String(d);
 }
+
 function makeBandLabel(distance, baseText) {
   const showNum = game.settings.get(MODULE_ID, "showNumericFallback");
   const label = bandForDistance(distance);
   return (showNum && baseText) ? `${label} (${baseText})` : label;
 }
+
 function shouldBand(ruler) {
   const onlySnapped = game.settings.get(MODULE_ID, "bandWhenSnappedOnly");
   if (!onlySnapped) return true;
@@ -73,11 +79,16 @@ function shouldBand(ruler) {
 
 // Extract a numeric distance from common call-sites / contexts
 function extractDistance(ctx, args, base) {
-  if (typeof args?.[0] === "number" && isFinite(args[0])) return args[0];  // _getSegmentLabel(distance,...)
+  // Primary: arg[0] is numeric distance for _getSegmentLabel(distance, opts)
+  if (typeof args?.[0] === "number" && isFinite(args[0])) return args[0];
+  // Segment tail (v12+)
   const seg = ctx?.segments?.at?.(-1);
   if (seg?.distance) return seg.distance;
+  // Total distance fallback (single segment)
   if (typeof ctx?.totalDistance === "number") return ctx.totalDistance;
+  // If base is numeric, use it
   if (typeof base === "number") return base;
+  // Parse from text like "60 ft [50 ft]"
   if (typeof base === "string") {
     const m = base.match(/(\d+(?:\.\d+)?)/);
     if (m) return Number(m[1]);
@@ -85,75 +96,100 @@ function extractDistance(ctx, args, base) {
   return 0;
 }
 
+/* ------------------------------ Hooking ----------------------------- */
+
 Hooks.once("ready", () => {
+  // Sanity logs
+  console.log(`${MODULE_ID} | Foundry version:`, game.version, "release:", getProperty(game, "release.generation"));
   if (!game.modules.get("lib-wrapper")?.active) {
     ui.notifications?.warn("Range Bands Ruler: libWrapper is not active. Labels may not change.");
+    console.warn(`${MODULE_ID} | libWrapper missing or inactive.`);
     return;
   }
+
   const lw = globalThis.libWrapper;
 
-  // Detect major version: v13+ exposes game.release?.generation
-  const major = Number(getProperty(game, "release.generation")) || (function () {
-    // Fallback: parse game.version "12.x.x"
-    const v = String(game.version ?? "").match(/^(\d+)/);
-    return v ? Number(v[1]) : 12;
-  })();
+  // Use the active ruler class (systems can override the default Ruler)
+  const RulerClass = CONFIG.Canvas?.rulerClass ?? globalThis.Ruler;
+  if (!RulerClass) {
+    console.warn(`${MODULE_ID} | No ruler class found to patch.`);
+    return;
+  }
+  const protoPath = `${RulerClass.name}.prototype`;
 
-  // --- v10–v12 primary hook: _getSegmentLabel(distance, opts) ---
-  if (getProperty(globalThis, "Ruler.prototype._getSegmentLabel")) {
-    lw.register(MODULE_ID, "Ruler.prototype._getSegmentLabel", function (wrapped, ...args) {
-      const base = wrapped(...args); // "60 ft"
-      if (!shouldBand(this)) return base;
-      const dist = extractDistance(this, args, base);
-      return makeBandLabel(dist, base);
-    }, "WRAPPER");
+  // Helper to register a wrapper safely and log it
+  function wrap(path, fn) {
+    if (getProperty(globalThis, path)) {
+      lw.register(MODULE_ID, path, fn, "WRAPPER");
+      console.log(`${MODULE_ID} | Wrapped ${path}`);
+      return true;
+    }
+    return false;
   }
 
-  // Fallbacks seen in some v10/11 builds
-  if (getProperty(globalThis, "Ruler.prototype._getRulerText")) {
-    lw.register(MODULE_ID, "Ruler.prototype._getRulerText", function (wrapped, ...args) {
-      const base = wrapped(...args);
-      if (!shouldBand(this)) return base;
-      const dist = extractDistance(this, args, base);
-      return makeBandLabel(dist, base);
-    }, "WRAPPER");
-  }
-  if (getProperty(globalThis, "Ruler.prototype._getMeasurementText")) {
-    lw.register(MODULE_ID, "Ruler.prototype._getMeasurementText", function (wrapped, ...args) {
-      const base = wrapped(...args);
-      if (!shouldBand(this)) return base;
-      const dist = extractDistance(this, args, base);
-      return makeBandLabel(dist, base);
-    }, "WRAPPER");
-  }
+  // v10–v12 primary: _getSegmentLabel(distance, opts)
+  const hooked1 = wrap(`${protoPath}._getSegmentLabel`, function (wrapped, ...args) {
+    const base = wrapped(...args); // e.g., "60 ft"
+    if (!shouldBand(this)) return base;
+    const dist = extractDistance(this, args, base);
+    const out = makeBandLabel(dist, base);
+    // Debug log once per second at most
+    if (CONFIG.debug?.rangeBandsRuler) console.log(`${MODULE_ID} | _getSegmentLabel ->`, { base, dist, out });
+    return out;
+  });
 
-  // --- v13+ formatter: _formatDistance(distance, opts) ---
-  if (major >= 13 && getProperty(globalThis, "Ruler.prototype._formatDistance")) {
-    lw.register(MODULE_ID, "Ruler.prototype._formatDistance", function (wrapped, distance, ...rest) {
-      const base = wrapped(distance, ...rest); // "60 ft"
-      if (!shouldBand(this)) return base;
-      return makeBandLabel(distance, base);
-    }, "WRAPPER");
-  }
+  // Older fallbacks (some v10/early v11 builds)
+  const hooked2 = wrap(`${protoPath}._getRulerText`, function (wrapped, ...args) {
+    const base = wrapped(...args);
+    if (!shouldBand(this)) return base;
+    const dist = extractDistance(this, args, base);
+    const out = makeBandLabel(dist, base);
+    if (CONFIG.debug?.rangeBandsRuler) console.log(`${MODULE_ID} | _getRulerText ->`, { base, dist, out });
+    return out;
+  });
 
-  // Ultimate fallback across versions: post-process tooltips after they are built
-  if (getProperty(globalThis, "Ruler.prototype._refreshTooltips")) {
-    lw.register(MODULE_ID, "Ruler.prototype._refreshTooltips", function (wrapped, ...args) {
-      const out = wrapped(...args);
-      try {
-        if (!shouldBand(this)) return out;
-        const labels = this?.labels ?? this?.tooltips ?? [];
-        for (const lab of labels) {
-          if (!lab || typeof lab.text !== "string") continue;
-          const d = (lab?.segment?.distance) ?? extractDistance(this, undefined, lab.text);
-          lab.text = makeBandLabel(d, lab.text);
+  const hooked3 = wrap(`${protoPath}._getMeasurementText`, function (wrapped, ...args) {
+    const base = wrapped(...args);
+    if (!shouldBand(this)) return base;
+    const dist = extractDistance(this, args, base);
+    const out = makeBandLabel(dist, base);
+    if (CONFIG.debug?.rangeBandsRuler) console.log(`${MODULE_ID} | _getMeasurementText ->`, { base, dist, out });
+    return out;
+  });
+
+  // v13+: _formatDistance(distance, opts)
+  const hooked4 = wrap(`${protoPath}._formatDistance`, function (wrapped, distance, ...rest) {
+    const base = wrapped(distance, ...rest);
+    if (!shouldBand(this)) return base;
+    const out = makeBandLabel(distance, base);
+    if (CONFIG.debug?.rangeBandsRuler) console.log(`${MODULE_ID} | _formatDistance ->`, { base, distance, out });
+    return out;
+  });
+
+  // Final safety net across versions: post-process tooltips after build
+  const hooked5 = wrap(`${protoPath}._refreshTooltips`, function (wrapped, ...args) {
+    const out = wrapped(...args);
+    try {
+      if (!shouldBand(this)) return out;
+      const labels = this?.labels ?? this?.tooltips ?? [];
+      for (const lab of labels) {
+        if (!lab || typeof lab.text !== "string") continue;
+        const d = (lab?.segment?.distance) ?? extractDistance(this, undefined, lab.text);
+        const newText = makeBandLabel(d, lab.text);
+        if (newText !== lab.text) {
+          if (CONFIG.debug?.rangeBandsRuler) console.log(`${MODULE_ID} | tooltip patch`, { from: lab.text, to: newText });
+          lab.text = newText;
         }
-      } catch (e) {
-        console.warn(`${MODULE_ID} | tooltip post-process failed`, e);
       }
-      return out;
-    }, "WRAPPER");
-  }
+    } catch (e) {
+      console.warn(`${MODULE_ID} | tooltip post-process failed`, e);
+    }
+    return out;
+  });
 
-  console.log(`${MODULE_ID} | Range band wrappers registered for v${major}.`);
+  // If nothing hooked, notify so you know to poke me
+  if (!(hooked1 || hooked2 || hooked3 || hooked4 || hooked5)) {
+    ui.notifications?.warn(`${MODULE_ID}: No ruler methods were patched. Your system may replace the ruler differently.`);
+    console.warn(`${MODULE_ID} | No ruler methods were patched on ${RulerClass.name}.`);
+  }
 });
