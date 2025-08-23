@@ -1,5 +1,6 @@
-// Range Bands Ruler — v1.4.3
-// Instance-patch approach for Foundry v10–v12 (and v13+). No libWrapper required.
+// Range Bands Ruler — v1.4.4
+// Instance-patch approach for Foundry v10–v12 (and v13+).
+// No libWrapper required for the label swap. Keeps module settings.
 
 const MODULE_ID = "range-bands-ruler";
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
@@ -67,11 +68,8 @@ function parseNum(text) {
   return m ? Number(m[1]) : 0;
 }
 
-/* ---------------------- PATCHED AREA: robust label access ---------------------- */
-
 /** Get an array of label display objects regardless of how the ruler stores them. */
 function getLabelNodes(ctx) {
-  // Common cases: array, PIXI.Container, or tooltips container
   if (Array.isArray(ctx?.labels)) return ctx.labels;
   if (ctx?.labels?.children && Array.isArray(ctx.labels.children)) return ctx.labels.children;
   if (Array.isArray(ctx?.tooltips)) return ctx.tooltips;
@@ -79,50 +77,33 @@ function getLabelNodes(ctx) {
   return [];
 }
 
-// Add this helper (anywhere above postProcessLabels)
-function getLabelNodes(ctx) {
-  if (Array.isArray(ctx?.labels)) return ctx.labels;
-  if (ctx?.labels?.children && Array.isArray(ctx.labels.children)) return ctx.labels.children;
-  if (Array.isArray(ctx?.tooltips)) return ctx.tooltips;
-  if (ctx?.tooltips?.children && Array.isArray(ctx.tooltips.children)) return ctx.tooltips.children;
-  return [];
-}
-
-/** Replace label texts using segment distances when available. */
+/** Replace label texts using segment distances when available (idempotent). */
 function postProcessLabels(ctx) {
   if (!shouldBand(ctx)) return;
 
   const labelNodes = getLabelNodes(ctx);
   const segs = Array.isArray(ctx?.segments) ? ctx.segments : [];
 
-  // Build from the label's ORIGINAL text (first seen), not whatever we wrote last time
+  // Build from each label's ORIGINAL text (cached once), never from already-banded text
   const build = (lab, segDist) => {
     if (!lab || typeof lab.text !== "string") return;
-    if (lab._rbrOriginal === undefined) lab._rbrOriginal = lab.text;      // cache first-seen text
-    const base = lab._rbrOriginal;                                       // always start from original numeric
+    if (lab._rbrOriginal === undefined) lab._rbrOriginal = lab.text;   // cache first-seen numeric string
+    const base = lab._rbrOriginal;
     const d = (segDist ?? parseNum(base)) || 0;
     lab.text = makeLabel(d, base);
   };
 
-  // 1: 1–to–1 labels ⇄ segments
   if (labelNodes.length && segs.length && labelNodes.length === segs.length) {
-    for (let i = 0; i < labelNodes.length; i++) {
-      const lab = labelNodes[i];
-      build(lab, segs[i]?.distance);
-    }
+    for (let i = 0; i < labelNodes.length; i++) build(labelNodes[i], segs[i]?.distance);
     return;
   }
-
-  // 2: Fallback—parse from original text
   for (const lab of labelNodes) build(lab, undefined);
 }
-/* ----------------------------------------------------------------------------- */
 
 /** Patch a single ruler instance (idempotent). */
 function patchRulerInstance(ruler) {
   if (!ruler || ruler._rbrPatched) return false;
 
-  // Prefer tooltip refresher if present
   if (typeof ruler._refreshTooltips === "function") {
     const orig = ruler._refreshTooltips.bind(ruler);
     ruler._refreshTooltips = function (...args) {
@@ -135,7 +116,6 @@ function patchRulerInstance(ruler) {
     return true;
   }
 
-  // Fallback: wrap measure
   if (typeof ruler.measure === "function") {
     const orig = ruler.measure.bind(ruler);
     ruler.measure = function (...args) {
