@@ -3,7 +3,7 @@
   "type": "module",
   "title": "Range Bands Ruler",
   "description": "Show configurable range bands (Close/Near/Far/etc.) on the Foundry ruler.",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "authors": [{ "name": "Thieves Guild Games" }],
   "compatibility": { "minimum": "11", "verified": "13" },
   "esmodules": ["scripts/range-bands.js"],
@@ -11,9 +11,9 @@
     "requires": [{ "id": "lib-wrapper", "type": "module", "compatibility": { "minimum": "1.12.0" } }]
   },
   "url": "https://github.com/thievesguild-games/range-bands-ruler",
-  "manifest": "https://raw.githubusercontent.com/thievesguild-games/range-bands-ruler/main/module.json",
+  "manifest": "https://raw.githubusercontent.com/thievesguild-games/range-bands-ruler/refs/heads/main/module.js",
   "download": "https://github.com/thievesguild-games/range-bands-ruler/archive/refs/heads/main.zip",
   "readme": "https://raw.githubusercontent.com/thievesguild-games/range-bands-ruler/main/README.md",
   "license": "https://raw.githubusercontent.com/thievesguild-games/range-bands-ruler/main/LICENSE",
-  "manifestPlusVersion": "1.0.0"
+  "manifestPlusVersion": "1.0.3"
 }
