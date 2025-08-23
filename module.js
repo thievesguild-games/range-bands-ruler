@@ -3,7 +3,7 @@
   "type": "module",
   "title": "Range Bands Ruler",
   "description": "Replaces the ruler’s numeric distance with configurable range bands (Close/Near/Far/etc.).",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "authors": [{ "name": "Thieves Guild Games" }],
   "compatibility": {
     "minimum": "11",
