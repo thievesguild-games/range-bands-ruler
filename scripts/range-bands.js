@@ -1,6 +1,6 @@
-// Range Bands Ruler — v1.5.0
-// Works on Foundry v10–v12 (instance patch via _refreshTooltips/measure)
-// and v13+ (instance patch via _formatDistance). No libWrapper needed.
+// Range Bands Ruler — v1.5.1
+// v12: instance patch (tooltips/measure)  |  v13+: prototype patch (_formatDistance via libWrapper)
+// Keeps: Show Numeric in Parentheses, Hide Bracket Distances, Only When Snapped
 
 const MODULE_ID = "range-bands-ruler";
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
@@ -33,7 +33,7 @@ Hooks.once("init", () => {
   });
   game.settings.register(MODULE_ID, "hideBracketDistances", {
     name: "Hide Bracket Distances",
-    hint: "Removes Foundry’s [segment total] from the label so the number appears only once.",
+    hint: "Removes Foundry’s [segment total] so the number appears only once.",
     scope: "client",
     config: true,
     default: true,
@@ -53,9 +53,7 @@ function getBands() {
   try {
     const a = JSON.parse(game.settings.get(MODULE_ID, "bands"));
     return Array.isArray(a) ? a : DEFAULT_BANDS;
-  } catch {
-    return DEFAULT_BANDS;
-  }
+  } catch { return DEFAULT_BANDS; }
 }
 function bandFor(d) {
   const arr = getBands();
@@ -81,7 +79,7 @@ function makeBandedLabel(distance, baseText) {
   return `${bandFor(distance)} (${base})`;
 }
 
-// ---- v12 label post-process helpers ----
+/* -------------------- v12 helpers (post-process labels) -------------------- */
 function getLabelNodes(ctx) {
   if (Array.isArray(ctx?.labels)) return ctx.labels;
   if (ctx?.labels?.children && Array.isArray(ctx.labels.children)) return ctx.labels.children;
@@ -119,27 +117,11 @@ function postProcessLabels_v12(ctx) {
   }
 }
 
-// ---- patch the live ruler instance (v12 & v13+) ----
-function patchRulerInstance(ruler) {
+/* -------------------- v12 instance patch -------------------- */
+function patchRulerInstance_v12(ruler) {
   if (!ruler) return false;
-  const gen = Number(gp(game, "release.generation")) || 12;
 
-  // v13+ : wrap _formatDistance to return band text directly
-  if (gen >= 13 && typeof ruler._formatDistance === "function" && !ruler._rbrPatchedFormat) {
-    const origFD = ruler._formatDistance.bind(ruler);
-    ruler._formatDistance = function (distance, ...rest) {
-      const base = origFD(distance, ...rest); // "60 ft" (possibly with bracketed total)
-      if (!shouldBand(this)) return base;
-      const d = typeof distance === "number" ? distance : parseNum(base);
-      return makeBandedLabel(d, base);
-    };
-    ruler._rbrPatchedFormat = true;
-    console.log(`${MODULE_ID} | Patched v13 instance via _formatDistance`);
-    return true;
-  }
-
-  // v12 fallback: patch _refreshTooltips, else patch measure
-  if (gen < 13 && typeof ruler._refreshTooltips === "function" && !ruler._rbrPatchedTooltips) {
+  if (typeof ruler._refreshTooltips === "function" && !ruler._rbrPatchedTooltips) {
     const orig = ruler._refreshTooltips.bind(ruler);
     ruler._refreshTooltips = function (...args) {
       const out = orig(...args);
@@ -150,7 +132,8 @@ function patchRulerInstance(ruler) {
     console.log(`${MODULE_ID} | Patched v12 instance via _refreshTooltips`);
     return true;
   }
-  if (gen < 13 && typeof ruler.measure === "function" && !ruler._rbrPatchedMeasure) {
+
+  if (typeof ruler.measure === "function" && !ruler._rbrPatchedMeasure) {
     const orig = ruler.measure.bind(ruler);
     ruler.measure = function (...args) {
       const out = orig(...args);
@@ -162,30 +145,77 @@ function patchRulerInstance(ruler) {
     return true;
   }
 
-  console.warn(`${MODULE_ID} | Could not find a method to patch on this ruler instance.`);
+  console.warn(`${MODULE_ID} | v12: Could not find a method to patch on this ruler instance.`);
   return false;
 }
 
-function tryPatchCurrentRuler() {
+function tryPatchCurrentRuler_v12() {
   const r =
     gp(canvas, "controls.ruler") ||
     gp(canvas, "hud.ruler") ||
     game.ruler ||
     gp(ui, "controls.controls.ruler");
-  if (r) patchRulerInstance(r);
+  if (r) patchRulerInstance_v12(r);
 }
 
-// Patch when canvas is available and when UI/state changes might recreate the ruler.
-Hooks.on("canvasReady", () => {
-  console.log(`${MODULE_ID} | canvasReady — attempting instance patch`);
-  tryPatchCurrentRuler();
-});
-Hooks.on("updateUser", () => tryPatchCurrentRuler());
-Hooks.on("controlToken", () => tryPatchCurrentRuler());
-Hooks.on("renderSceneControls", () => tryPatchCurrentRuler());
+/* -------------------- v13+ prototype patch via libWrapper -------------------- */
+function patchPrototype_v13() {
+  const gen = Number(gp(game, "release.generation")) || 0;
+  if (gen < 13) return false;
 
-// Optional API
+  const lw = game.modules.get("lib-wrapper");
+  const RulerClass = gp(CONFIG, "Canvas.rulerClass") ?? globalThis.Ruler;
+  const className = RulerClass?.name || "Ruler";
+
+  // Prefer libWrapper (string target form)
+  if (lw?.active) {
+    const path = `${className}.prototype._formatDistance`;
+    const exists = !!gp(globalThis, path);
+    console.log(`${MODULE_ID} | v13: ${exists ? "Hooking" : "Missing"} ${path}`);
+    if (exists) {
+      libWrapper.register(MODULE_ID, path, function (wrapped, distance, ...rest) {
+        const base = wrapped(distance, ...rest); // "60 ft"
+        if (!shouldBand(this)) return base;
+        const d = typeof distance === "number" ? distance : parseNum(base);
+        return makeBandedLabel(d, base);
+      }, "WRAPPER");
+      return true;
+    }
+  }
+
+  // Fallback: monkey-patch prototype directly if libWrapper missing
+  const proto = RulerClass?.prototype;
+  if (proto && typeof proto._formatDistance === "function" && !proto._rbrPatchedFormat) {
+    const orig = proto._formatDistance;
+    proto._formatDistance = function (distance, ...rest) {
+      const base = orig.call(this, distance, ...rest);
+      if (!shouldBand(this)) return base;
+      const d = typeof distance === "number" ? distance : parseNum(base);
+      return makeBandedLabel(d, base);
+    };
+    proto._rbrPatchedFormat = true;
+    console.log(`${MODULE_ID} | v13: Patched prototype via _formatDistance (no libWrapper)`);
+    return true;
+  }
+
+  console.warn(`${MODULE_ID} | v13: Could not find _formatDistance to patch.`);
+  return false;
+}
+
+/* -------------------- lifecycle -------------------- */
+Hooks.on("canvasReady", () => {
+  const gen = Number(gp(game, "release.generation")) || 12;
+  if (gen >= 13) {
+    patchPrototype_v13();
+  } else {
+    console.log(`${MODULE_ID} | canvasReady — attempting v12 instance patch`);
+    tryPatchCurrentRuler_v12();
+  }
+});
+
+// Also try on ready (useful if canvas already mounted)
 Hooks.once("ready", () => {
-  const mod = game.modules.get(MODULE_ID);
-  if (mod) mod.api = { repatch: () => tryPatchCurrentRuler() };
+  const gen = Number(gp(game, "release.generation")) || 12;
+  if (gen >= 13) patchPrototype_v13();
+  else tryPatchCurrentRuler_v12();
 });
