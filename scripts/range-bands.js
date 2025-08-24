@@ -1,6 +1,6 @@
-// Range Bands Ruler — v1.4.7
-// Instance-patch approach for Foundry v10–v12 (and v13+).
-// No libWrapper required for the label swap. Keeps module settings.
+// Range Bands Ruler — v1.5.0
+// Works on Foundry v10–v12 (instance patch via _refreshTooltips/measure)
+// and v13+ (instance patch via _formatDistance). No libWrapper needed.
 
 const MODULE_ID = "range-bands-ruler";
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
@@ -31,20 +31,20 @@ Hooks.once("init", () => {
     default: true,
     type: Boolean
   });
-  game.settings.register(MODULE_ID, "bandWhenSnappedOnly", {
-    name: "Only Show Bands When Snapped",
-    hint: "If enabled, only show bands when the ruler is snapped to grid.",
-    scope: "client",
-    config: true,
-    default: false,
-    type: Boolean
-  });
   game.settings.register(MODULE_ID, "hideBracketDistances", {
     name: "Hide Bracket Distances",
-    hint: "If enabled, removes Foundry’s [segment total] from the ruler label. You’ll only see one numeric value when 'Show Numeric in Parentheses' is on.",
+    hint: "Removes Foundry’s [segment total] from the label so the number appears only once.",
     scope: "client",
     config: true,
     default: true,
+    type: Boolean
+  });
+  game.settings.register(MODULE_ID, "bandWhenSnappedOnly", {
+    name: "Only Show Bands When Snapped",
+    hint: "If enabled, only show bands when the ruler is snapped to the grid.",
+    scope: "client",
+    config: true,
+    default: false,
     type: Boolean
   });
 });
@@ -62,25 +62,26 @@ function bandFor(d) {
   for (const b of arr) if (d >= b.min && d <= b.max) return b.label;
   return arr.length ? arr[arr.length - 1].label : String(d);
 }
-function makeLabel(d, base) {
-  let cleanBase = base;
-  if (game.settings.get(MODULE_ID, "hideBracketDistances")) {
-    // Strip out anything inside [brackets]
-    cleanBase = cleanBase.replace(/\[.*?\]/g, "").trim();
-  }
-  const show = game.settings.get(MODULE_ID, "showNumericFallback");
-  return show && cleanBase ? `${bandFor(d)} (${cleanBase})` : bandFor(d);
+function parseNum(text) {
+  const m = typeof text === "string" ? text.match(/(\d+(?:\.\d+)?)/) : null;
+  return m ? Number(m[1]) : 0;
+}
+function cleanBaseText(t) {
+  let s = String(t ?? "");
+  if (game.settings.get(MODULE_ID, "hideBracketDistances")) s = s.replace(/\[.*?\]/g, "").trim();
+  return s;
 }
 function shouldBand(ruler) {
   const only = game.settings.get(MODULE_ID, "bandWhenSnappedOnly");
   return !only || Boolean(ruler?.snapped ?? true);
 }
-function parseNum(text) {
-  const m = typeof text === "string" ? text.match(/(\d+(?:\.\d+)?)/) : null;
-  return m ? Number(m[1]) : 0;
+function makeBandedLabel(distance, baseText) {
+  const base = cleanBaseText(baseText);
+  if (!game.settings.get(MODULE_ID, "showNumericFallback")) return bandFor(distance);
+  return `${bandFor(distance)} (${base})`;
 }
 
-/** Get an array of label display objects regardless of how the ruler stores them. */
+// ---- v12 label post-process helpers ----
 function getLabelNodes(ctx) {
   if (Array.isArray(ctx?.labels)) return ctx.labels;
   if (ctx?.labels?.children && Array.isArray(ctx.labels.children)) return ctx.labels.children;
@@ -88,11 +89,8 @@ function getLabelNodes(ctx) {
   if (ctx?.tooltips?.children && Array.isArray(ctx.tooltips.children)) return ctx.tooltips.children;
   return [];
 }
-
-// Remove any previous "Band (...)" wrappers so we always rebuild from the raw numeric
 function stripBandWrappers(text) {
   let t = String(text ?? "");
-  // unwrap up to 6 times to be safe (Near (Near (15 ft)))
   for (let i = 0; i < 6; i++) {
     const m = t.match(/^\s*[^()]+?\s*\((.*)\)\s*$/);
     if (!m) break;
@@ -100,9 +98,7 @@ function stripBandWrappers(text) {
   }
   return t.trim();
 }
-
-/** Replace label texts using segment distances when available (idempotent). */
-function postProcessLabels(ctx) {
+function postProcessLabels_v12(ctx) {
   if (!shouldBand(ctx)) return;
 
   const labelNodes = getLabelNodes(ctx);
@@ -110,22 +106,10 @@ function postProcessLabels(ctx) {
 
   const apply = (lab, segDist) => {
     if (!lab || typeof lab.text !== "string") return;
-
-    // Start from the underlying numeric string (strip any earlier band wrappers)
     let base = stripBandWrappers(lab.text);
-
-    // Optionally remove Foundry’s bracketed total before display
-    if (game.settings.get(MODULE_ID, "hideBracketDistances")) {
-      base = base.replace(/\[.*?\]/g, "").trim();
-    }
-
-    // Choose a numeric distance: prefer segment value, fallback to parsed number
+    base = cleanBaseText(base);
     const d = (segDist ?? parseNum(base)) || 0;
-
-    // Rebuild label exactly once
-    lab.text = game.settings.get(MODULE_ID, "showNumericFallback")
-      ? `${bandFor(d)} (${base})`
-      : bandFor(d);
+    lab.text = makeBandedLabel(d, base);
   };
 
   if (labelNodes.length && segs.length && labelNodes.length === segs.length) {
@@ -135,31 +119,46 @@ function postProcessLabels(ctx) {
   }
 }
 
-/** Patch a single ruler instance (idempotent). */
+// ---- patch the live ruler instance (v12 & v13+) ----
 function patchRulerInstance(ruler) {
-  if (!ruler || ruler._rbrPatched) return false;
+  if (!ruler) return false;
+  const gen = Number(gp(game, "release.generation")) || 12;
 
-  if (typeof ruler._refreshTooltips === "function") {
-    const orig = ruler._refreshTooltips.bind(ruler);
-    ruler._refreshTooltips = function (...args) {
-      const out = orig(...args);
-      try { postProcessLabels(this); } catch (e) { console.warn(`${MODULE_ID} | _refreshTooltips patch failed`, e); }
-      return out;
+  // v13+ : wrap _formatDistance to return band text directly
+  if (gen >= 13 && typeof ruler._formatDistance === "function" && !ruler._rbrPatchedFormat) {
+    const origFD = ruler._formatDistance.bind(ruler);
+    ruler._formatDistance = function (distance, ...rest) {
+      const base = origFD(distance, ...rest); // "60 ft" (possibly with bracketed total)
+      if (!shouldBand(this)) return base;
+      const d = typeof distance === "number" ? distance : parseNum(base);
+      return makeBandedLabel(d, base);
     };
-    ruler._rbrPatched = true;
-    console.log(`${MODULE_ID} | Patched instance via _refreshTooltips`);
+    ruler._rbrPatchedFormat = true;
+    console.log(`${MODULE_ID} | Patched v13 instance via _formatDistance`);
     return true;
   }
 
-  if (typeof ruler.measure === "function") {
+  // v12 fallback: patch _refreshTooltips, else patch measure
+  if (gen < 13 && typeof ruler._refreshTooltips === "function" && !ruler._rbrPatchedTooltips) {
+    const orig = ruler._refreshTooltips.bind(ruler);
+    ruler._refreshTooltips = function (...args) {
+      const out = orig(...args);
+      try { postProcessLabels_v12(this); } catch (e) { console.warn(`${MODULE_ID} | _refreshTooltips patch failed`, e); }
+      return out;
+    };
+    ruler._rbrPatchedTooltips = true;
+    console.log(`${MODULE_ID} | Patched v12 instance via _refreshTooltips`);
+    return true;
+  }
+  if (gen < 13 && typeof ruler.measure === "function" && !ruler._rbrPatchedMeasure) {
     const orig = ruler.measure.bind(ruler);
     ruler.measure = function (...args) {
       const out = orig(...args);
-      try { postProcessLabels(this); } catch (e) { console.warn(`${MODULE_ID} | measure patch failed`, e); }
+      try { postProcessLabels_v12(this); } catch (e) { console.warn(`${MODULE_ID} | measure patch failed`, e); }
       return out;
     };
-    ruler._rbrPatched = true;
-    console.log(`${MODULE_ID} | Patched instance via measure`);
+    ruler._rbrPatchedMeasure = true;
+    console.log(`${MODULE_ID} | Patched v12 instance via measure`);
     return true;
   }
 
@@ -167,7 +166,6 @@ function patchRulerInstance(ruler) {
   return false;
 }
 
-/** Try to find and patch the current user's ruler instance. */
 function tryPatchCurrentRuler() {
   const r =
     gp(canvas, "controls.ruler") ||
@@ -177,7 +175,7 @@ function tryPatchCurrentRuler() {
   if (r) patchRulerInstance(r);
 }
 
-// Patch when the canvas is ready and on a few lifecycle hooks in case the ruler is recreated.
+// Patch when canvas is available and when UI/state changes might recreate the ruler.
 Hooks.on("canvasReady", () => {
   console.log(`${MODULE_ID} | canvasReady — attempting instance patch`);
   tryPatchCurrentRuler();
@@ -186,7 +184,7 @@ Hooks.on("updateUser", () => tryPatchCurrentRuler());
 Hooks.on("controlToken", () => tryPatchCurrentRuler());
 Hooks.on("renderSceneControls", () => tryPatchCurrentRuler());
 
-// Expose a tiny API
+// Optional API
 Hooks.once("ready", () => {
   const mod = game.modules.get(MODULE_ID);
   if (mod) mod.api = { repatch: () => tryPatchCurrentRuler() };
