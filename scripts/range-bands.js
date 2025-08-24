@@ -1,4 +1,4 @@
-// Range Bands Ruler — v1.5.15
+// Range Bands Ruler — v1.5.16
 // v12 & v13 support with reliable live distance for v13
 
 const MODULE_ID = "range-bands-ruler";
@@ -213,7 +213,7 @@ function patchPrototypeV13() {
 
           // Keep distance numeric; if it's 0/undefined, compute it live from the ruler
           let dNum = (typeof ctx.distance === "number" ? ctx.distance : 0);
-          if (!dNum || dNum <= 0) dNum = getLiveDistance(this);
+          if (!dNum || dNum >= 0) dNum = getLiveDistance(this);
 
           // Derive plain units from scene, never reuse formatted ctx.units
           const sceneUnits = String(canvas?.scene?.grid?.units ?? ctx.units ?? "").trim();
