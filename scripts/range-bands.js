@@ -1,4 +1,4 @@
-// Range Bands Ruler — v1.4.5
+// Range Bands Ruler — v1.4.6
 // Instance-patch approach for Foundry v10–v12 (and v13+).
 // No libWrapper required for the label swap. Keeps module settings.
 
@@ -39,6 +39,14 @@ Hooks.once("init", () => {
     default: false,
     type: Boolean
   });
+  game.settings.register(MODULE_ID, "hideBracketDistances", {
+    name: "Hide Bracket Distances",
+    hint: "If enabled, removes Foundry’s [segment total] from the ruler label. You’ll only see one numeric value when 'Show Numeric in Parentheses' is on.",
+    scope: "client",
+    config: true,
+    default: true,
+    type: Boolean
+  });
 });
 
 function getBands() {
@@ -55,9 +63,13 @@ function bandFor(d) {
   return arr.length ? arr[arr.length - 1].label : String(d);
 }
 function makeLabel(d, base) {
-  return game.settings.get(MODULE_ID, "showNumericFallback") && base
-    ? `${bandFor(d)} (${base})`
-    : bandFor(d);
+  let cleanBase = base;
+  if (game.settings.get(MODULE_ID, "hideBracketDistances")) {
+    // Strip out anything inside [brackets]
+    cleanBase = cleanBase.replace(/\[.*?\]/g, "").trim();
+  }
+  const show = game.settings.get(MODULE_ID, "showNumericFallback");
+  return show && cleanBase ? `${bandFor(d)} (${cleanBase})` : bandFor(d);
 }
 function shouldBand(ruler) {
   const only = game.settings.get(MODULE_ID, "bandWhenSnappedOnly");
