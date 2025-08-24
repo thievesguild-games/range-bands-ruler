@@ -1,5 +1,5 @@
 // ============================================================================
-// Range Bands Ruler  —  v1.5.22
+// Range Bands Ruler  —  v1.5.23
 // Thieves Guild Games
 //
 // v12 + v13 support with robust distance recovery for the pill.
@@ -80,14 +80,13 @@ function bandFor(d) {
   const EPS = 1e-6;
   const arr = getBands().slice().sort((a, b) => a.max - b.max);
   if (!arr.length) return `${d}`;
-
-  // If d is below the first band's min, clamp to the first band
+  // Clamp below first band
   if (d < arr[0].min - EPS) return arr[0].label;
-
-  // Choose the first band whose max upper-bounds d (fills gaps automatically)
-  for (const b of arr) {
-    if (d <= b.max + EPS) return b.label;
-  }
+  // Choose first band whose max bounds d (fills gaps toward earlier band)
+  for (const b of arr) if (d <= b.max + EPS) return b.label;
+  // Otherwise clamp to top band
+  return arr[arr.length - 1].label;
+}
 
   // Otherwise clamp to the highest band
   return arr[arr.length - 1].label;
@@ -276,22 +275,25 @@ function patchPrototypeV13() {
       const ctx = orig.apply(this, args);
       try {
         if (!ctx || !shouldBand(this)) return ctx;
-
-        let d = (typeof ctx.distance === "number" ? ctx.distance : 0);
-        if (!d || d <= 0) d = computeLiveDistanceV13(this, ctx.position);
-
+    
+        // Always compute once, then round once, and use the same number everywhere.
+        let d = computeLiveDistanceV13(this, ctx.position);
+        const dRounded = Number(d.toFixed(2));   // match pill style
         const units = getSceneUnits();
-        const band  = bandFor(d);
-
-        if (DEBUG_RBR) console.log(`[${MODULE_ID}] d=${d} units=${units} band=${band}`);
-
+    
+        // Keep the pill’s numeric in sync with the band decision
+        ctx.distance = dRounded;
+    
+        const band = bandFor(dRounded);
+        if (DEBUG_RBR) console.log(`[${MODULE_ID}] d=${dRounded} units=${units} band=${band}`);
+    
         if (game.settings.get(MODULE_ID, "showNumericFallback")) {
-          ctx.units = units ? `${units} • ${band}` : band;
+          ctx.units = units ? `${units} • ${band}` : band;   // e.g. "4.94 m • Melee"
         } else {
           ctx.units = band;
-          ctx.distance = "";
+          ctx.distance = "";                                 // show only the band text
         }
-
+    
         if (game.settings.get(MODULE_ID, "hideBracketDistances") && typeof ctx.units === "string") {
           ctx.units = ctx.units.replace(/\[.*?\]/g, "").trim();
         }
