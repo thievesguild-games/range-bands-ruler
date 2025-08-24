@@ -1,5 +1,5 @@
 // ============================================================================
-// Range Bands Ruler  —  v1.5.24
+// Range Bands Ruler  —  v1.5.25
 // Thieves Guild Games
 //
 // v12 + v13 support. For v13 we:
@@ -267,16 +267,20 @@ function patchPrototypeV13() {
         // Keep the pill numeric in sync with the band decision
         ctx.distance = dRounded;
 
-        const band = bandFor(dRounded);
+        // --- force-render full pill text inside units ---
+        const numeric = Number.isFinite(dRounded) ? `${dRounded} ${units}` : (units || "");
+        const band    = bandFor(dRounded);
+        
         if (DEBUG_RBR) console.log(`[${MODULE_ID}] d=${dRounded} units=${units} band=${band}`);
-
-        if (game.settings.get(MODULE_ID, "showNumericFallback")) {
-          ctx.units = units ? `${units} • ${band}` : band; // e.g., "4.92 m • Close"
-        } else {
-          ctx.units = band;
-          ctx.distance = ""; // show only the band text
-        }
-
+        
+        // Always show numeric in v13; the setting only affects v12 parentheses style
+        const full = numeric ? `${numeric} • ${band}` : band;
+        
+        // Put the whole string in units, and blank distance so Foundry doesn't add its own
+        ctx.units = full;
+        ctx.distance = "";  // important: prevents double numeric from Foundry
+        
+        // Optional cleanup if you also hide bracketed totals
         if (game.settings.get(MODULE_ID, "hideBracketDistances") && typeof ctx.units === "string") {
           ctx.units = ctx.units.replace(/\[.*?\]/g, "").trim();
         }
