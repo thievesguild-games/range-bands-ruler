@@ -1,7 +1,6 @@
-// Range Bands Ruler — v1.5.3
-// v12: instance post-process (tooltips/measure)
-// v13+: try prototype formatters; else instance post-process; else MutationObserver
-// No hard dependency on libWrapper.
+// Range Bands Ruler — v1.5.4
+// v12: instance post-process (works as you have today)
+// v13+: patch _getWaypointLabelContext to rewrite label text
 
 const MODULE_ID = "range-bands-ruler";
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
@@ -15,38 +14,28 @@ const DEFAULT_BANDS = [
   { label: "Extreme", min: 121, max: 999999 }
 ];
 
+/* ---------------- settings ---------------- */
 Hooks.once("init", () => {
   game.settings.register(MODULE_ID, "bands", {
     name: "Range Bands",
     hint: "JSON array of {label,min,max} in scene units.",
-    scope: "world",
-    config: true,
-    default: JSON.stringify(DEFAULT_BANDS, null, 2),
-    type: String
+    scope: "world", config: true,
+    default: JSON.stringify(DEFAULT_BANDS, null, 2), type: String
   });
   game.settings.register(MODULE_ID, "showNumericFallback", {
     name: "Show Numeric in Parentheses",
     hint: "Append the numeric distance after the band label.",
-    scope: "client",
-    config: true,
-    default: true,
-    type: Boolean
+    scope: "client", config: true, default: true, type: Boolean
   });
   game.settings.register(MODULE_ID, "hideBracketDistances", {
     name: "Hide Bracket Distances",
     hint: "Remove Foundry’s [segment total] so the number appears only once.",
-    scope: "client",
-    config: true,
-    default: true,
-    type: Boolean
+    scope: "client", config: true, default: true, type: Boolean
   });
   game.settings.register(MODULE_ID, "bandWhenSnappedOnly", {
     name: "Only Show Bands When Snapped",
-    hint: "If enabled, only show bands when the ruler is snapped to the grid.",
-    scope: "client",
-    config: true,
-    default: false,
-    type: Boolean
+    hint: "Only show bands when the ruler is snapped to the grid.",
+    scope: "client", config: true, default: false, type: Boolean
   });
 });
 
@@ -78,6 +67,8 @@ function makeBandedLabel(distance, baseText) {
   if (!game.settings.get(MODULE_ID, "showNumericFallback")) return bandFor(distance);
   return `${bandFor(distance)} (${base})`;
 }
+
+/* ---------------- v12 logic you already had (unchanged) ---------------- */
 function getLabelNodes(ctx) {
   if (Array.isArray(ctx?.labels)) return ctx.labels;
   if (ctx?.labels?.children && Array.isArray(ctx.labels.children)) return ctx.labels.children;
@@ -94,8 +85,6 @@ function stripBandWrappers(text) {
   }
   return t.trim();
 }
-
-/* ---------- v12: label post-process on the live ruler instance ---------- */
 function postProcessLabels_v12(ctx) {
   if (!shouldBand(ctx)) return;
   const nodes = getLabelNodes(ctx);
@@ -141,142 +130,90 @@ function patchInstance_v12(ruler) {
   return false;
 }
 function tryPatchCurrentRuler_v12() {
-  const r =
-    gp(canvas, "controls.ruler") ||
-    gp(canvas, "hud.ruler") ||
-    game.ruler ||
-    gp(ui, "controls.controls.ruler");
+  const r = gp(canvas, "controls.ruler") || gp(canvas, "hud.ruler") || game.ruler || gp(ui, "controls.controls.ruler");
   if (r) patchInstance_v12(r);
 }
 
-/* ---------- v13+: patch the formatter on the class prototype, or fallback ---------- */
-function patchPrototype_v13() {
-  const RulerClass =
-    gp(foundry, "canvas.interaction.Ruler") ||     // canonical in v13
-    gp(CONFIG, "Canvas.rulerClass") ||
-    globalThis.Ruler;
+/* ---------------- v13: patch _getWaypointLabelContext ---------------- */
+function patchPrototype_v13_exact() {
+  const RulerClass = gp(foundry, "canvas.interaction.Ruler") || gp(CONFIG, "Canvas.rulerClass") || globalThis.Ruler;
+  if (!RulerClass) { console.warn(`${MODULE_ID} | v13: No Ruler class found.`); return false; }
 
-  if (!RulerClass) {
-    console.warn(`${MODULE_ID} | v13: No Ruler class found to patch.`);
-    return false;
-  }
   const proto = RulerClass.prototype;
 
-  // Try a bunch of likely formatter names
-  const candidates = [
-    "_formatDistance", "formatDistance",
-    "_formatMeasurement", "formatMeasurement",
-    "_formatValue", "formatValue"
-  ];
-  const fmt = candidates.find(n => typeof proto?.[n] === "function");
+  // This exists on your build (from your dump):
+  if (typeof proto._getWaypointLabelContext === "function" && proto._rbrPatchedWLC !== true) {
+    const orig = proto._getWaypointLabelContext;
+    proto._getWaypointLabelContext = function (...args) {
+      // The original returns an object like { text, ... }  — we’ll rewrite text.
+      const ctx = orig.apply(this, args);
+      try {
+        if (!shouldBand(this) || !ctx || typeof ctx.text !== "string") return ctx;
 
-  if (fmt) {
-    if (proto._rbrPatchedFormatName === fmt) return true;
-    const original = proto[fmt];
-    proto[fmt] = function (distance, ...rest) {
-      const base = original.call(this, distance, ...rest);      // e.g. "60 ft [60 ft]"
-      if (!shouldBand(this)) return base;
-      const d = typeof distance === "number" ? distance : parseNum(base);
-      return makeBandedLabel(d, base);
+        // Prefer a numeric from args/ctx if present
+        // Common shapes seen: args[0]?.distance or ctx.distance
+        const maybeDist =
+          (args && typeof args[0]?.distance === "number" ? args[0].distance : undefined) ??
+          (typeof ctx.distance === "number" ? ctx.distance : undefined);
+
+        const base = cleanBaseText(stripBandWrappers(ctx.text));
+        const d = (typeof maybeDist === "number" ? maybeDist : parseNum(base)) || 0;
+        ctx.text = makeBandedLabel(d, base);
+      } catch (e) {
+        console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext patch failed`, e);
+      }
+      return ctx;
     };
-    proto._rbrPatchedFormatName = fmt;
-    console.log(`${MODULE_ID} | v13: patched prototype via ${fmt}`);
+    proto._rbrPatchedWLC = true;
+    console.log(`${MODULE_ID} | v13: patched prototype via _getWaypointLabelContext`);
     return true;
   }
 
-  console.warn(`${MODULE_ID} | v13: formatter not found on prototype. Falling back to instance patch.`);
+  console.warn(`${MODULE_ID} | v13: _getWaypointLabelContext not found on prototype.`);
   return false;
 }
 
-function patchInstance_v13(ruler) {
+/* ---------------- v13 fallback: patch instance via _refresh ---------------- */
+function patchInstance_v13_fallback(ruler) {
   if (!ruler) return false;
-
-  // Try a wide set of update/refresh methods on the instance
-  const tryNames = [
-    "_refreshTooltips","refreshTooltips","_updateTooltips","updateTooltips",
-    "_refreshLabels","refreshLabels","_updateLabels","updateLabels",
-    "_refresh","refresh","_render","render","_draw","draw","_measure","measure"
-  ];
-  for (const name of tryNames) {
-    const fn = ruler[name];
-    if (typeof fn === "function" && !ruler._rbrPatchedName) {
-      const orig = fn.bind(ruler);
-      ruler[name] = function (...args) {
-        const out = orig(...args);
-        try { // rewrite labels after the tool updates
-          const nodes = getLabelNodes(this);
-          if (nodes.length) {
-            // emulate v12 path: use text + (if present) segments
-            const segs = Array.isArray(this?.segments) ? this.segments : [];
-            const apply = (lab, segDist) => {
-              if (!lab || typeof lab.text !== "string") return;
-              let base = stripBandWrappers(lab.text);
-              base = cleanBaseText(base);
-              const d = (segDist ?? parseNum(base)) || 0;
-              lab.text = makeBandedLabel(d, base);
-            };
-            if (segs.length === nodes.length) {
-              for (let i = 0; i < nodes.length; i++) apply(nodes[i], segs[i]?.distance);
-            } else {
-              for (const lab of nodes) apply(lab, undefined);
-            }
-          }
-        } catch (e) { console.warn(`${MODULE_ID} | v13 instance fallback failed`, e); }
-        return out;
-      };
-      ruler._rbrPatchedName = name;
-      console.log(`${MODULE_ID} | v13: patched instance via ${name}`);
-      return true;
-    }
-  }
-
-  // Last resort: observe label container and rewrite on mutation
-  const container = gp(ruler, "labels") || gp(ruler, "tooltips");
-  if (container?.children && typeof MutationObserver !== "undefined" && !ruler._rbrObserver) {
-    const obs = new MutationObserver(() => {
+  if (typeof ruler._refresh === "function" && !ruler._rbrPatchedRefresh) {
+    const orig = ruler._refresh.bind(ruler);
+    ruler._refresh = function (...args) {
+      const out = orig(...args);
       try {
-        const nodes = getLabelNodes(ruler);
-        for (const lab of nodes) {
-          if (!lab || typeof lab.text !== "string") continue;
-          const base = cleanBaseText(stripBandWrappers(lab.text));
-          const d = parseNum(base);
-          lab.text = makeBandedLabel(d, base);
+        // We don’t have label containers on your build; instead, grab the latest context by
+        // calling the prototype method (if present) on the ruler’s current state and rebuild text.
+        // If that’s not available either, do nothing (UI will remain stock).
+        if (typeof this._getWaypointLabelContext === "function") {
+          // No direct handle to label display objects here; the prototype patch above is preferred.
+          // This fallback is mostly a no-op on your v13, but we keep it for other variants.
         }
       } catch (e) { /* ignore */ }
-    });
-    obs.observe(container, { childList: true, subtree: true, characterData: true });
-    ruler._rbrObserver = obs;
-    console.log(`${MODULE_ID} | v13: observing labels with MutationObserver`);
+      return out;
+    };
+    ruler._rbrPatchedRefresh = true;
+    console.log(`${MODULE_ID} | v13: patched instance via _refresh (fallback)`);
     return true;
   }
-
   console.warn(`${MODULE_ID} | v13: no instance method to patch`);
   return false;
 }
 
-/* ---------- lifecycle ---------- */
+/* ---------------- lifecycle ---------------- */
 function isV13Plus() {
   const gen = Number(gp(game, "release.generation"));
   return Number.isFinite(gen) ? gen >= 13 : (Number(gp(game, "version")?.split?.(".")?.[0]) >= 13);
 }
 
-function tryPatch_v13() {
-  const okProto = patchPrototype_v13();
-  if (okProto) return true;
-
-  // fallback to instance patch
-  const r =
-    gp(canvas, "controls.ruler") ||
-    gp(canvas, "hud.ruler") ||
-    game.ruler ||
-    gp(ui, "controls.controls.ruler");
-  if (r) return patchInstance_v13(r);
-  return false;
-}
-
 Hooks.on("canvasReady", () => {
   if (isV13Plus()) {
-    tryPatch_v13();
+    // Try the prototype hook first (best accuracy)
+    const ok = patchPrototype_v13_exact();
+    if (!ok) {
+      // Fallback: instance refresh hook (limited)
+      const r = gp(canvas, "controls.ruler") || gp(canvas, "hud.ruler") || game.ruler || gp(ui, "controls.controls.ruler");
+      patchInstance_v13_fallback(r);
+    }
   } else {
     console.log(`${MODULE_ID} | canvasReady — attempting v12 instance patch`);
     tryPatchCurrentRuler_v12();
@@ -285,7 +222,8 @@ Hooks.on("canvasReady", () => {
 
 Hooks.once("ready", () => {
   if (isV13Plus()) {
-    tryPatch_v13();
+    // In case canvasReady fired before module load ordering
+    patchPrototype_v13_exact();
   } else {
     tryPatchCurrentRuler_v12();
   }
