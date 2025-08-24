@@ -1,5 +1,5 @@
 // ============================================================================
-// Range Bands Ruler  —  v1.5.18
+// Range Bands Ruler  —  v1.5.19
 // Thieves Guild Games
 //
 // Works with Foundry VTT v12 and v13
@@ -21,7 +21,7 @@
 // ============================================================================
 
 const MODULE_ID = "range-bands-ruler";
-const DEBUG_RBR = false; // flip true while testing to see d/units/band in console
+const DEBUG_RBR = true; // flip true while testing to see d/units/band in console
 
 // Foundry-safe getProperty
 const gp = (obj, path) => foundry?.utils?.getProperty ? foundry.utils.getProperty(obj, path) : undefined;
