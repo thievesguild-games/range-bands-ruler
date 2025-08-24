@@ -1,4 +1,4 @@
-// Range Bands Ruler — v1.4.6
+// Range Bands Ruler — v1.4.7
 // Instance-patch approach for Foundry v10–v12 (and v13+).
 // No libWrapper required for the label swap. Keeps module settings.
 
