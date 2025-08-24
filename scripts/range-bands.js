@@ -1,5 +1,5 @@
 // ============================================================================
-// Range Bands Ruler  —  v1.5.21
+// Range Bands Ruler  —  v1.5.22
 // Thieves Guild Games
 //
 // v12 + v13 support with robust distance recovery for the pill.
@@ -77,12 +77,20 @@ function getBands() {
 }
 
 function bandFor(d) {
-  const arr = getBands();
-  let chosen = arr.length ? arr[arr.length - 1].label : `${d}`;
+  const EPS = 1e-6;
+  const arr = getBands().slice().sort((a, b) => a.max - b.max);
+  if (!arr.length) return `${d}`;
+
+  // If d is below the first band's min, clamp to the first band
+  if (d < arr[0].min - EPS) return arr[0].label;
+
+  // Choose the first band whose max upper-bounds d (fills gaps automatically)
   for (const b of arr) {
-    if (d >= b.min && d <= b.max) { chosen = b.label; break; }
+    if (d <= b.max + EPS) return b.label;
   }
-  return chosen;
+
+  // Otherwise clamp to the highest band
+  return arr[arr.length - 1].label;
 }
 
 function parseNum(text) {
