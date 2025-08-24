@@ -1,16 +1,14 @@
-// Range Bands Ruler — v1.5.10
-// v12: instance post-process of label text (tooltips/measure)
-// v13+: patch the Ruler prototype (preferred: _getWaypointLabelContext;
-//       fallback: _getSegmentStyle; last resort: prototype _refresh)
-// No hard dependency on libWrapper.
+// Range Bands Ruler — v1.5.11
+// v12: instance post-process of label text
+// v13: append band to pill units (distance stays numeric) + style/fallback patches
 
 const MODULE_ID = "range-bands-ruler";
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
 
-/* ---------------- settings ---------------- */
+/* ---------------- Settings ---------------- */
 const DEFAULT_BANDS = [
   { label: "Contact", min: 0,  max: 1 },
-  { label: "Close",   min: 2,  max: 5 },
+  { label: "Close",   min: 1,  max: 5 },
   { label: "Near",    min: 6,  max: 15 },
   { label: "Far",     min: 16, max: 30 },
   { label: "Distant", min: 31, max: 120 },
@@ -41,35 +39,35 @@ Hooks.once("init", () => {
   });
 });
 
-/* ---------------- helpers ---------------- */
-function rbrGetBands() {
+/* ---------------- Helpers ---------------- */
+function getBands() {
   try { const a = JSON.parse(game.settings.get(MODULE_ID, "bands")); return Array.isArray(a) ? a : DEFAULT_BANDS; }
   catch { return DEFAULT_BANDS; }
 }
-function rbrBandFor(d) {
-  const arr = rbrGetBands();
+function bandFor(d) {
+  const arr = getBands();
   for (const b of arr) if (d >= b.min && d <= b.max) return b.label;
   return arr.length ? arr[arr.length - 1].label : String(d);
 }
-function rbrParseNum(text) {
+function parseNum(text) {
   const m = typeof text === "string" ? text.match(/(\d+(?:\.\d+)?)/) : null;
   return m ? Number(m[1]) : 0;
 }
-function rbrCleanBase(t) {
+function cleanBase(t) {
   let s = String(t ?? "");
   if (game.settings.get(MODULE_ID, "hideBracketDistances")) s = s.replace(/\[.*?\]/g, "").trim();
   return s;
 }
-function rbrShouldBand(ruler) {
+function shouldBand(ruler) {
   const only = game.settings.get(MODULE_ID, "bandWhenSnappedOnly");
   return !only || Boolean(ruler?.snapped ?? true);
 }
-function rbrMakeLabel(distance, baseText) {
-  const base = rbrCleanBase(baseText);
-  if (!game.settings.get(MODULE_ID, "showNumericFallback")) return rbrBandFor(distance);
-  return `${rbrBandFor(distance)} (${base})`;
+function makeBanded(distance, baseText) {
+  const base = cleanBase(baseText);
+  if (!game.settings.get(MODULE_ID, "showNumericFallback")) return bandFor(distance);
+  return `${bandFor(distance)} (${base})`;
 }
-function rbrStripBandWrappers(text) {
+function stripBandWrappers(text) {
   let t = String(text ?? "");
   for (let i = 0; i < 6; i++) {
     const m = t.match(/^\s*[^()]+?\s*\((.*)\)\s*$/);
@@ -78,30 +76,30 @@ function rbrStripBandWrappers(text) {
   }
   return t.trim();
 }
-function rbrGetLabelNodes(ctx) {
+function getLabelNodes(ctx) {
   if (Array.isArray(ctx?.labels)) return ctx.labels;
   if (ctx?.labels?.children && Array.isArray(ctx.labels.children)) return ctx.labels.children;
   if (Array.isArray(ctx?.tooltips)) return ctx.tooltips;
   if (ctx?.tooltips?.children && Array.isArray(ctx.tooltips.children)) return ctx.tooltips.children;
   return [];
 }
-function rbrIsV13Plus() {
+function isV13Plus() {
   const gen = Number(gp(game, "release.generation"));
   return Number.isFinite(gen) ? gen >= 13 : (Number((game?.version || "0").split(".")[0]) >= 13);
 }
 
 /* ---------------- v12: instance post-process ---------------- */
-function rbrPostProcessLabelsV12(ctx) {
-  if (!rbrShouldBand(ctx)) return;
-  const nodes = rbrGetLabelNodes(ctx);
+function postProcessLabelsV12(ctx) {
+  if (!shouldBand(ctx)) return;
+  const nodes = getLabelNodes(ctx);
   const segs  = Array.isArray(ctx?.segments) ? ctx.segments : [];
 
   const apply = (lab, segDist) => {
     if (!lab || typeof lab.text !== "string") return;
-    let base = rbrStripBandWrappers(lab.text);
-    base = rbrCleanBase(base);
-    const d = (segDist ?? rbrParseNum(base)) || 0;
-    lab.text = rbrMakeLabel(d, base);
+    let base = stripBandWrappers(lab.text);
+    base = cleanBase(base);
+    const d = (segDist ?? parseNum(base)) || 0;
+    lab.text = makeBanded(d, base);
   };
 
   if (nodes.length && segs.length && nodes.length === segs.length) {
@@ -110,14 +108,14 @@ function rbrPostProcessLabelsV12(ctx) {
     for (const lab of nodes) apply(lab, undefined);
   }
 }
-function rbrPatchInstanceV12(ruler) {
+function patchInstanceV12(ruler) {
   if (!ruler) return false;
 
   if (typeof ruler._refreshTooltips === "function" && !ruler._rbrPatchedTooltips) {
     const orig = ruler._refreshTooltips.bind(ruler);
     ruler._refreshTooltips = function (...args) {
       const out = orig(...args);
-      try { rbrPostProcessLabelsV12(this); } catch (e) { console.warn(`${MODULE_ID} | v12 _refreshTooltips patch failed`, e); }
+      try { postProcessLabelsV12(this); } catch (e) { console.warn(`${MODULE_ID} | v12 _refreshTooltips patch failed`, e); }
       return out;
     };
     ruler._rbrPatchedTooltips = true;
@@ -129,7 +127,7 @@ function rbrPatchInstanceV12(ruler) {
     const orig = ruler.measure.bind(ruler);
     ruler.measure = function (...args) {
       const out = orig(...args);
-      try { rbrPostProcessLabelsV12(this); } catch (e) { console.warn(`${MODULE_ID} | v12 measure patch failed`, e); }
+      try { postProcessLabelsV12(this); } catch (e) { console.warn(`${MODULE_ID} | v12 measure patch failed`, e); }
       return out;
     };
     ruler._rbrPatchedMeasure = true;
@@ -140,13 +138,13 @@ function rbrPatchInstanceV12(ruler) {
   console.warn(`${MODULE_ID} | v12: no instance method to patch`);
   return false;
 }
-function rbrTryPatchCurrentRulerV12() {
+function tryPatchCurrentRulerV12() {
   const r = gp(canvas, "controls.ruler") || gp(canvas, "hud.ruler") || game.ruler || gp(ui, "controls.controls.ruler");
-  if (r) rbrPatchInstanceV12(r);
+  if (r) patchInstanceV12(r);
 }
 
-/* ---------------- v13: prototype patch (definitive) ---------------- */
-function rbrGetRulerProtos() {
+/* ---------------- v13: prototype patch ---------------- */
+function getRulerProtos() {
   const candidates = [
     gp(foundry, "canvas.interaction.Ruler"),
     gp(CONFIG, "Canvas.rulerClass"),
@@ -154,36 +152,64 @@ function rbrGetRulerProtos() {
   ].filter(Boolean);
   return candidates.map(C => C && C.prototype).filter(Boolean);
 }
-function rbrPatchPrototypeV13() {
+
+function patchPrototypeV13() {
   let patchedAny = false;
 
-  for (const proto of rbrGetRulerProtos()) {
+  for (const proto of getRulerProtos()) {
     if (!proto) continue;
 
-    // ---- Preferred for some systems: leave here if you already have it, but DISABLE modifying ctx.distance/units ----
-    // (We won't use _getWaypointLabelContext anymore on your build to avoid type issues.)
+    // Preferred: rewrite pill by appending band to units (distance stays numeric)
+    if (typeof proto._getWaypointLabelContext === "function" && !proto._rbrPatchedWLC) {
+      const orig = proto._getWaypointLabelContext;
+      proto._getWaypointLabelContext = function (...args) {
+        const ctx = orig.apply(this, args);
+        try {
+          if (!ctx || !shouldBand(this)) return ctx;
 
-    // ---- Patch _getSegmentStyle: provide final label text safely ----
+          const dNum = typeof ctx.distance === "number"
+            ? ctx.distance
+            : (typeof args?.[0]?.distance === "number" ? args[0].distance : parseNum(String(ctx.distance)));
+
+          const base = cleanBase(`${dNum} ${ctx.units ?? ""}`.trim());
+          const band = bandFor(dNum);
+
+          if (game.settings.get(MODULE_ID, "showNumericFallback")) {
+            const dot = ctx.units ? " • " : " ";
+            ctx.units = `${ctx.units ?? ""}${dot}${band}`.trim(); // "4.2 m • Near"
+            // ctx.distance remains numeric
+          } else {
+            ctx.units = band;   // "Near"
+            ctx.distance = "";  // print just "Near"
+          }
+
+          if (game.settings.get(MODULE_ID, "hideBracketDistances") && typeof ctx.units === "string") {
+            ctx.units = ctx.units.replace(/\[.*?\]/g, "").trim();
+          }
+        } catch (e) {
+          console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext pill patch failed`, e);
+        }
+        return ctx;
+      };
+      proto._rbrPatchedWLC = true;
+      patchedAny = true;
+      console.log(`${MODULE_ID} | v13: patched _getWaypointLabelContext (units += band; distance numeric)`);
+    }
+
+    // Style-level safety net (some systems compose label text here)
     if (typeof proto._getSegmentStyle === "function" && !proto._rbrPatchedSegStyle) {
       const orig = proto._getSegmentStyle;
       proto._getSegmentStyle = function (...args) {
         const style = orig.apply(this, args) ?? {};
         try {
-          if (!rbrShouldBand(this)) return style;
-
-          // Find the text field in the returned style
+          if (!shouldBand(this)) return style;
           const key = "label" in style ? "label" : ("text" in style ? "text" : null);
-          if (key) {
-            // Build a base like "60 ft" from whatever the engine would already show
-            const baseRaw = String(style[key] ?? "");
-            const base    = rbrCleanBase(rbrStripBandWrappers(baseRaw));
-            const d       = rbrParseNum(base);
-
-            style[key] = rbrMakeLabel(d || 0, base); // e.g., "Near (60 ft)" or "Near"
+          if (key && typeof style[key] === "string") {
+            const base = cleanBase(stripBandWrappers(style[key]));
+            const d    = parseNum(base);
+            style[key] = makeBanded(d || 0, base);
           }
-        } catch (e) {
-          console.warn(`${MODULE_ID} | v13 _getSegmentStyle patch failed`, e);
-        }
+        } catch (e) { console.warn(`${MODULE_ID} | v13 _getSegmentStyle patch failed`, e); }
         return style;
       };
       proto._rbrPatchedSegStyle = true;
@@ -191,25 +217,23 @@ function rbrPatchPrototypeV13() {
       console.log(`${MODULE_ID} | v13: patched prototype via _getSegmentStyle`);
     }
 
-    // ---- Last-resort fallback: rewrite PIXI label nodes after refresh ----
+    // Last-resort fallback: rewrite any PIXI label nodes after refresh
     if (typeof proto._refresh === "function" && !proto._rbrPatchedRefresh) {
       const orig = proto._refresh;
       proto._refresh = function (...args) {
         const out = orig.apply(this, args);
         try {
-          if (!rbrShouldBand(this)) return out;
+          if (!shouldBand(this)) return out;
           const nodes = (this?.labels?.children && Array.isArray(this.labels.children)) ? this.labels.children
                       : (this?.tooltips?.children && Array.isArray(this.tooltips.children)) ? this.tooltips.children
                       : [];
           for (const lab of nodes) {
             if (!lab || typeof lab.text !== "string") continue;
-            const base = rbrCleanBase(rbrStripBandWrappers(lab.text));
-            const d    = rbrParseNum(base);
-            lab.text   = rbrMakeLabel(d || 0, base);
+            const base = cleanBase(stripBandWrappers(lab.text));
+            const d    = parseNum(base);
+            lab.text   = makeBanded(d || 0, base);
           }
-        } catch (e) {
-          console.warn(`${MODULE_ID} | v13 prototype _refresh fallback failed`, e);
-        }
+        } catch (e) { console.warn(`${MODULE_ID} | v13 prototype _refresh fallback failed`, e); }
         return out;
       };
       proto._rbrPatchedRefresh = true;
@@ -222,26 +246,25 @@ function rbrPatchPrototypeV13() {
   return patchedAny;
 }
 
-/* ---------------- lifecycle ---------------- */
-function rbrTryPatchV13WithRetries() {
-  let ok = rbrPatchPrototypeV13();
+/* ---------------- Lifecycle ---------------- */
+function tryPatchV13WithRetries() {
+  let ok = patchPrototypeV13();
   if (ok) return;
-  // Retry shortly and when scene controls render (some systems set/replace the class late)
-  setTimeout(() => rbrPatchPrototypeV13(), 200);
-  Hooks.once("renderSceneControls", () => rbrPatchPrototypeV13());
+  setTimeout(() => patchPrototypeV13(), 200);
+  Hooks.once("renderSceneControls", () => patchPrototypeV13());
 }
 
 Hooks.once("ready", () => {
-  if (rbrIsV13Plus()) {
-    rbrTryPatchV13WithRetries();
+  if (isV13Plus()) {
+    tryPatchV13WithRetries();
   } else {
-    rbrTryPatchCurrentRulerV12();
+    tryPatchCurrentRulerV12();
   }
 });
 Hooks.on("canvasReady", () => {
-  if (rbrIsV13Plus()) {
-    rbrTryPatchV13WithRetries();
+  if (isV13Plus()) {
+    tryPatchV13WithRetries();
   } else {
-    rbrTryPatchCurrentRulerV12();
+    tryPatchCurrentRulerV12();
   }
 });
