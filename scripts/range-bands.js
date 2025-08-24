@@ -1,4 +1,4 @@
-// Range Bands Ruler — v1.4.4
+// Range Bands Ruler — v1.4.5
 // Instance-patch approach for Foundry v10–v12 (and v13+).
 // No libWrapper required for the label swap. Keeps module settings.
 
@@ -84,19 +84,21 @@ function postProcessLabels(ctx) {
   const labelNodes = getLabelNodes(ctx);
   const segs = Array.isArray(ctx?.segments) ? ctx.segments : [];
 
-  // Build from each label's ORIGINAL text (cached once), never from already-banded text
+  // Build from segment distance if available, otherwise parse text
   const build = (lab, segDist) => {
     if (!lab || typeof lab.text !== "string") return;
-    if (lab._rbrOriginal === undefined) lab._rbrOriginal = lab.text;   // cache first-seen numeric string
-    const base = lab._rbrOriginal;
+    const base = lab.text; // whatever Foundry just wrote (numeric distance)
     const d = (segDist ?? parseNum(base)) || 0;
     lab.text = makeLabel(d, base);
   };
 
   if (labelNodes.length && segs.length && labelNodes.length === segs.length) {
-    for (let i = 0; i < labelNodes.length; i++) build(labelNodes[i], segs[i]?.distance);
+    for (let i = 0; i < labelNodes.length; i++) {
+      build(labelNodes[i], segs[i]?.distance);
+    }
     return;
   }
+
   for (const lab of labelNodes) build(lab, undefined);
 }
 
