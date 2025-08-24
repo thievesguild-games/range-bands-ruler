@@ -1,4 +1,4 @@
-// Range Bands Ruler — v1.5.8
+// Range Bands Ruler — v1.5.9
 // v12: instance post-process of label text (tooltips/measure)
 // v13+: patch the Ruler prototype (preferred: _getWaypointLabelContext;
 //       fallback: _getSegmentStyle; last resort: prototype _refresh)
