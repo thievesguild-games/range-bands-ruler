@@ -1,6 +1,7 @@
-// Range Bands Ruler — v1.5.1
-// v12: instance patch (tooltips/measure)  |  v13+: prototype patch (_formatDistance via libWrapper)
-// Keeps: Show Numeric in Parentheses, Hide Bracket Distances, Only When Snapped
+// Range Bands Ruler — v1.5.2
+// v12: instance post-process (tooltips/measure)
+// v13+: prototype formatter patch (formatDistance/*Measurement*) with fallback to instance post-process
+// No hard dependency on libWrapper (works with or without it).
 
 const MODULE_ID = "range-bands-ruler";
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
@@ -33,7 +34,7 @@ Hooks.once("init", () => {
   });
   game.settings.register(MODULE_ID, "hideBracketDistances", {
     name: "Hide Bracket Distances",
-    hint: "Removes Foundry’s [segment total] so the number appears only once.",
+    hint: "Remove Foundry’s [segment total] so the number appears only once.",
     scope: "client",
     config: true,
     default: true,
@@ -49,11 +50,10 @@ Hooks.once("init", () => {
   });
 });
 
+/* ---------------- helpers ---------------- */
 function getBands() {
-  try {
-    const a = JSON.parse(game.settings.get(MODULE_ID, "bands"));
-    return Array.isArray(a) ? a : DEFAULT_BANDS;
-  } catch { return DEFAULT_BANDS; }
+  try { const a = JSON.parse(game.settings.get(MODULE_ID, "bands")); return Array.isArray(a) ? a : DEFAULT_BANDS; }
+  catch { return DEFAULT_BANDS; }
 }
 function bandFor(d) {
   const arr = getBands();
@@ -79,7 +79,7 @@ function makeBandedLabel(distance, baseText) {
   return `${bandFor(distance)} (${base})`;
 }
 
-/* -------------------- v12 helpers (post-process labels) -------------------- */
+/* ---------- v12: label post-process on the live ruler instance ---------- */
 function getLabelNodes(ctx) {
   if (Array.isArray(ctx?.labels)) return ctx.labels;
   if (ctx?.labels?.children && Array.isArray(ctx.labels.children)) return ctx.labels.children;
@@ -116,8 +116,6 @@ function postProcessLabels_v12(ctx) {
     for (const lab of labelNodes) apply(lab, undefined);
   }
 }
-
-/* -------------------- v12 instance patch -------------------- */
 function patchRulerInstance_v12(ruler) {
   if (!ruler) return false;
 
@@ -125,7 +123,7 @@ function patchRulerInstance_v12(ruler) {
     const orig = ruler._refreshTooltips.bind(ruler);
     ruler._refreshTooltips = function (...args) {
       const out = orig(...args);
-      try { postProcessLabels_v12(this); } catch (e) { console.warn(`${MODULE_ID} | _refreshTooltips patch failed`, e); }
+      try { postProcessLabels_v12(this); } catch (e) { console.warn(`${MODULE_ID} | v12 _refreshTooltips patch failed`, e); }
       return out;
     };
     ruler._rbrPatchedTooltips = true;
@@ -137,7 +135,7 @@ function patchRulerInstance_v12(ruler) {
     const orig = ruler.measure.bind(ruler);
     ruler.measure = function (...args) {
       const out = orig(...args);
-      try { postProcessLabels_v12(this); } catch (e) { console.warn(`${MODULE_ID} | measure patch failed`, e); }
+      try { postProcessLabels_v12(this); } catch (e) { console.warn(`${MODULE_ID} | v12 measure patch failed`, e); }
       return out;
     };
     ruler._rbrPatchedMeasure = true;
@@ -148,7 +146,6 @@ function patchRulerInstance_v12(ruler) {
   console.warn(`${MODULE_ID} | v12: Could not find a method to patch on this ruler instance.`);
   return false;
 }
-
 function tryPatchCurrentRuler_v12() {
   const r =
     gp(canvas, "controls.ruler") ||
@@ -158,54 +155,50 @@ function tryPatchCurrentRuler_v12() {
   if (r) patchRulerInstance_v12(r);
 }
 
-/* -------------------- v13+ prototype patch via libWrapper -------------------- */
+/* ---------- v13+: patch the formatter on the class prototype ---------- */
 function patchPrototype_v13() {
-  const gen = Number(gp(game, "release.generation")) || 0;
-  if (gen < 13) return false;
+  const RulerClass =
+    gp(foundry, "canvas.interaction.Ruler") ||     // canonical in v13
+    gp(CONFIG, "Canvas.rulerClass") ||
+    globalThis.Ruler;                               // deprecated global
 
-  const lw = game.modules.get("lib-wrapper");
-  const RulerClass = gp(CONFIG, "Canvas.rulerClass") ?? globalThis.Ruler;
-  const className = RulerClass?.name || "Ruler";
-
-  // Prefer libWrapper (string target form)
-  if (lw?.active) {
-    const path = `${className}.prototype._formatDistance`;
-    const exists = !!gp(globalThis, path);
-    console.log(`${MODULE_ID} | v13: ${exists ? "Hooking" : "Missing"} ${path}`);
-    if (exists) {
-      libWrapper.register(MODULE_ID, path, function (wrapped, distance, ...rest) {
-        const base = wrapped(distance, ...rest); // "60 ft"
-        if (!shouldBand(this)) return base;
-        const d = typeof distance === "number" ? distance : parseNum(base);
-        return makeBandedLabel(d, base);
-      }, "WRAPPER");
-      return true;
-    }
+  if (!RulerClass) {
+    console.warn(`${MODULE_ID} | v13: No Ruler class found to patch.`);
+    return false;
   }
 
-  // Fallback: monkey-patch prototype directly if libWrapper missing
-  const proto = RulerClass?.prototype;
-  if (proto && typeof proto._formatDistance === "function" && !proto._rbrPatchedFormat) {
-    const orig = proto._formatDistance;
-    proto._formatDistance = function (distance, ...rest) {
-      const base = orig.call(this, distance, ...rest);
-      if (!shouldBand(this)) return base;
-      const d = typeof distance === "number" ? distance : parseNum(base);
-      return makeBandedLabel(d, base);
-    };
-    proto._rbrPatchedFormat = true;
-    console.log(`${MODULE_ID} | v13: Patched prototype via _formatDistance (no libWrapper)`);
-    return true;
+  const proto = RulerClass.prototype;
+  const fmtName = ["_formatDistance", "formatDistance", "_formatMeasurement", "formatMeasurement"]
+    .find(n => typeof proto?.[n] === "function");
+
+  if (!fmtName) {
+    console.warn(`${MODULE_ID} | v13: Missing Ruler.prototype._/format(Distance|Measurement).`);
+    return false;
   }
 
-  console.warn(`${MODULE_ID} | v13: Could not find _formatDistance to patch.`);
-  return false;
+  if (proto._rbrPatchedFormatName === fmtName) return true; // already patched
+
+  const original = proto[fmtName];
+  proto[fmtName] = function (distance, ...rest) {
+    const base = original.call(this, distance, ...rest);  // e.g., "60 ft [60 ft]"
+    if (!shouldBand(this)) return base;
+    const d = typeof distance === "number" ? distance : parseNum(base);
+    return makeBandedLabel(d, base);
+  };
+  proto._rbrPatchedFormatName = fmtName;
+
+  console.log(`${MODULE_ID} | v13: Patched prototype via ${fmtName}`);
+  return true;
 }
 
-/* -------------------- lifecycle -------------------- */
+/* ---------- lifecycle ---------- */
+function isV13Plus() {
+  const gen = Number(gp(game, "release.generation"));
+  return Number.isFinite(gen) ? gen >= 13 : (Number(gp(game, "version")?.split?.(".")?.[0]) >= 13);
+}
+
 Hooks.on("canvasReady", () => {
-  const gen = Number(gp(game, "release.generation")) || 12;
-  if (gen >= 13) {
+  if (isV13Plus()) {
     patchPrototype_v13();
   } else {
     console.log(`${MODULE_ID} | canvasReady — attempting v12 instance patch`);
@@ -213,9 +206,10 @@ Hooks.on("canvasReady", () => {
   }
 });
 
-// Also try on ready (useful if canvas already mounted)
 Hooks.once("ready", () => {
-  const gen = Number(gp(game, "release.generation")) || 12;
-  if (gen >= 13) patchPrototype_v13();
-  else tryPatchCurrentRuler_v12();
+  if (isV13Plus()) {
+    patchPrototype_v13();
+  } else {
+    tryPatchCurrentRuler_v12();
+  }
 });
