@@ -1,29 +1,29 @@
 // ============================================================================
-// Range Bands Ruler  —  v1.5.19
+// Range Bands Ruler  —  v1.5.20
 // Thieves Guild Games
 //
 // Works with Foundry VTT v12 and v13
-// - v13: uses _getWaypointLabelContext and computes live distance from segments
-//        (segment.ray.distance in pixels -> scene units). No more d=0.
-//        Keeps ctx.distance numeric; appends band to units: "m • Near"
-//        (or just "Near" if you disable numeric).
-// - v12: post-processes the PIXI labels after measurement/tooltip refresh.
+// v13 changes:
+//  - Monkey-patches Ruler prototype directly (no libWrapper), avoiding
+//    "Parameter 'target' must be a number or a string" registration errors.
+//  - Computes distance from segment.ray.distance (pixels) -> scene units.
+//  - Builds pill as "14.5 m • Near" (or just "Near" if you disable numeric).
 //
-// Requires: libWrapper (hard dependency in your manifest)
+// v12:
+//  - Post-processes PIXI ruler labels after measurement and tooltip refresh.
+//
 // Settings:
-//   - bands (world, JSON): [{label,min,max}, ...] in scene units (feet, meters,
-//     whatever your scene uses)
+//   - bands (world, JSON of {label, min, max} in scene units)
 //   - showNumericFallback (client)
 //   - hideBracketDistances (client)
 //   - bandWhenSnappedOnly (client)
 // Debugging:
-//   - set DEBUG_RBR = true to log computed distances and bands in v13
+//   - DEBUG_RBR = true (left ON here) logs d/units/band while you drag.
 // ============================================================================
 
 const MODULE_ID = "range-bands-ruler";
-const DEBUG_RBR = true; // flip true while testing to see d/units/band in console
+const DEBUG_RBR = true; // keep ON until you're satisfied
 
-// Foundry-safe getProperty
 const gp = (obj, path) => foundry?.utils?.getProperty ? foundry.utils.getProperty(obj, path) : undefined;
 
 /* ---------------- Settings ---------------- */
@@ -72,13 +72,12 @@ function getBands() {
   try {
     const parsed = JSON.parse(game.settings.get(MODULE_ID, "bands"));
     if (Array.isArray(parsed)) {
-      // normalize & sort (gap-safe, order-agnostic)
       return parsed
         .map(b => ({ label: String(b.label), min: Number(b.min), max: Number(b.max) }))
         .filter(b => Number.isFinite(b.min) && Number.isFinite(b.max))
         .sort((a, b) => a.min - b.min);
     }
-  } catch { /* ignore */ }
+  } catch {/* ignore */}
   return DEFAULT_BANDS;
 }
 
@@ -117,34 +116,37 @@ function shouldBand(ruler) {
   return !only || Boolean(ruler?.snapped ?? true);
 }
 
+function getSceneUnits() {
+  return String(canvas?.scene?.grid?.units ?? "").trim();
+}
+
 /** v13: compute live distance from segments/waypoints */
 function computeLiveDistanceV13(ruler) {
-  // Prefer segments (supports multi-waypoint rulers)
+  const dim = canvas?.dimensions;
+  if (!dim) return 0;
+
+  const unitsPerPixel = (dim.distance ?? 1) / (dim.size ?? 1);
+
+  // Sum all segment distances if present
   const segs = ruler?.segments;
-  const dim  = canvas?.dimensions;
-  if (Array.isArray(segs) && dim) {
-    const unitsPerPixel = (dim.distance ?? 1) / (dim.size ?? 1);
+  if (Array.isArray(segs) && segs.length) {
     let total = 0;
     for (const s of segs) {
-      if (s?.ray?.distance != null) {
-        total += s.ray.distance * unitsPerPixel;        // v13: pixels -> scene units
-      } else if (typeof s?.distance === "number") {
-        total += s.distance;                             // fallback (v12-style)
-      }
+      if (s?.ray?.distance != null) total += s.ray.distance * unitsPerPixel; // v13 preferred
+      else if (typeof s?.distance === "number") total += s.distance;         // v12 fallback
     }
     if (total > 0) return total;
   }
 
-  // Fallback: compute straight-line between first/last waypoint
+  // Fallback: straight line from first to last waypoint
   const wps = ruler?.waypoints;
-  if (Array.isArray(wps) && wps.length >= 2 && dim) {
+  if (Array.isArray(wps) && wps.length >= 2) {
     const a = wps[0], b = wps[wps.length - 1];
     const dx = (b.x ?? 0) - (a.x ?? 0);
     const dy = (b.y ?? 0) - (a.y ?? 0);
     const pixels = Math.hypot(dx, dy);
-    const unitsPerPixel = (dim.distance ?? 1) / (dim.size ?? 1);
-    const dist = pixels * unitsPerPixel;
-    if (dist > 0) return dist;
+    const units  = pixels * unitsPerPixel;
+    if (units > 0) return units;
   }
 
   return 0;
@@ -157,11 +159,7 @@ function makeBandedText(distance, baseText) {
   return `${band} (${base})`;
 }
 
-function getSceneUnits() {
-  return String(canvas?.scene?.grid?.units ?? "").trim();
-}
-
-/* ---------------- v12 patches (instance post-process) ---------------- */
+/* ---------------- v12 patches (instance) ---------------- */
 
 function getLabelNodes(ctx) {
   if (Array.isArray(ctx?.labels)) return ctx.labels;
@@ -228,7 +226,7 @@ function tryPatchCurrentRulerV12() {
   if (r) patchInstanceV12(r);
 }
 
-/* ---------------- v13 patches (prototype via libWrapper) ---------------- */
+/* ---------------- v13 patches (prototype, no libWrapper) ---------------- */
 
 function getRulerClass() {
   return gp(foundry, "canvas.interaction.Ruler") || gp(CONFIG, "Canvas.rulerClass") || globalThis.Ruler;
@@ -240,75 +238,62 @@ function patchPrototypeV13() {
     console.warn(`${MODULE_ID} | v13: Ruler prototype not found; will retry.`);
     return false;
   }
-
   const proto = R.prototype;
 
-  // Preferred: modify waypoint context (HTML pill)
+  // Patch the pill context (preferred)
   if (typeof proto._getWaypointLabelContext === "function" && !proto._rbrPatchedWLC) {
-    libWrapper.register(
-      MODULE_ID,
-      proto._getWaypointLabelContext,
-      function (wrapped, ...args) {
-        const ctx = wrapped.apply(this, args);
-        try {
-          if (!ctx || !shouldBand(this)) return ctx;
+    const orig = proto._getWaypointLabelContext;
+    proto._getWaypointLabelContext = function (...args) {
+      const ctx = orig.apply(this, args);
+      try {
+        if (!ctx || !shouldBand(this)) return ctx;
 
-          // distance may be 0/undefined here -> compute live
-          let d = (typeof ctx.distance === "number" ? ctx.distance : 0);
-          if (!d || d <= 0) d = computeLiveDistanceV13(this);
+        let d = (typeof ctx.distance === "number" ? ctx.distance : 0);
+        if (!d || d <= 0) d = computeLiveDistanceV13(this);
 
-          const band = bandFor(d);
-          const units = getSceneUnits();
+        const units = getSceneUnits();
+        const band  = bandFor(d);
 
-          if (DEBUG_RBR) console.log(`[${MODULE_ID}] d=${d} units=${units} band=${band}`);
+        if (DEBUG_RBR) console.log(`[${MODULE_ID}] d=${d} units=${units} band=${band}`);
 
-          if (game.settings.get(MODULE_ID, "showNumericFallback")) {
-            // pill: "14.5 m • Near"
-            ctx.units = units ? `${units} • ${band}` : band;
-            // leave ctx.distance numeric
-          } else {
-            // pill: "Near"
-            ctx.units = band;
-            ctx.distance = ""; // show only the band
-          }
-
-          if (game.settings.get(MODULE_ID, "hideBracketDistances") && typeof ctx.units === "string") {
-            ctx.units = ctx.units.replace(/\[.*?\]/g, "").trim();
-          }
-        } catch (e) {
-          console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext patch failed`, e);
+        if (game.settings.get(MODULE_ID, "showNumericFallback")) {
+          ctx.units = units ? `${units} • ${band}` : band;   // pill: 14.5 m • Near
+        } else {
+          ctx.units = band;                                  // pill: Near
+          ctx.distance = "";                                 // hide numeric in pill
         }
-        return ctx;
-      },
-      "WRAPPER"
-    );
+
+        if (game.settings.get(MODULE_ID, "hideBracketDistances") && typeof ctx.units === "string") {
+          ctx.units = ctx.units.replace(/\[.*?\]/g, "").trim();
+        }
+      } catch (e) {
+        console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext patch failed`, e);
+      }
+      return ctx;
+    };
     proto._rbrPatchedWLC = true;
     console.log(`${MODULE_ID} | v13: patched via _getWaypointLabelContext`);
   }
 
-  // Fallback: after refresh, rewrite any PIXI labels (rarely needed in v13)
+  // Fallback: rewrite PIXI labels after refresh (rarely used on v13)
   if (typeof proto._refresh === "function" && !proto._rbrPatchedRefresh) {
-    libWrapper.register(
-      MODULE_ID,
-      proto._refresh,
-      function (wrapped, ...args) {
-        const out = wrapped.apply(this, args);
-        try {
-          if (!shouldBand(this)) return out;
-          const nodes = (this?.labels?.children && Array.isArray(this.labels.children)) ? this.labels.children
-                      : (this?.tooltips?.children && Array.isArray(this.tooltips.children)) ? this.tooltips.children
-                      : [];
-          for (const lab of nodes) {
-            if (!lab || typeof lab.text !== "string") continue;
-            const base = cleanBase(stripBandWrappers(lab.text));
-            const d    = parseNum(base);
-            lab.text   = makeBandedText(d || 0, base);
-          }
-        } catch (e) { console.warn(`${MODULE_ID} | v13 _refresh fallback failed`, e); }
-        return out;
-      },
-      "WRAPPER"
-    );
+    const orig = proto._refresh;
+    proto._refresh = function (...args) {
+      const out = orig.apply(this, args);
+      try {
+        if (!shouldBand(this)) return out;
+        const nodes = (this?.labels?.children && Array.isArray(this.labels.children)) ? this.labels.children
+                    : (this?.tooltips?.children && Array.isArray(this.tooltips.children)) ? this.tooltips.children
+                    : [];
+        for (const lab of nodes) {
+          if (!lab || typeof lab.text !== "string") continue;
+          const base = cleanBase(stripBandWrappers(lab.text));
+          const d    = parseNum(base);
+          lab.text   = makeBandedText(d || 0, base);
+        }
+      } catch (e) { console.warn(`${MODULE_ID} | v13 _refresh fallback failed`, e); }
+      return out;
+    };
     proto._rbrPatchedRefresh = true;
     console.log(`${MODULE_ID} | v13: patched prototype via _refresh (fallback)`);
   }
@@ -319,7 +304,6 @@ function patchPrototypeV13() {
 function tryPatchV13WithRetries() {
   const ok = patchPrototypeV13();
   if (ok) return;
-  // retry shortly (class may be set up a tick later)
   setTimeout(() => patchPrototypeV13(), 200);
   Hooks.once("renderSceneControls", () => patchPrototypeV13());
 }
