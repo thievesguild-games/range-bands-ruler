@@ -1,9 +1,10 @@
-// Range Bands Ruler — v1.5.12
-// Works with Foundry v12 and v13
-// v12: post-process label text after measurement
-// v13: keep distance numeric; append band to units from scene; style/fallback patches
+// Range Bands Ruler — v1.5.13
+// Works on Foundry v12 & v13
 
 const MODULE_ID = "range-bands-ruler";
+// Flip to true to log distances/bands while testing v13
+const DEBUG_RBR = false;
+
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
 
 /* ---------------- Settings ---------------- */
@@ -19,7 +20,7 @@ const DEFAULT_BANDS = [
 Hooks.once("init", () => {
   game.settings.register(MODULE_ID, "bands", {
     name: "Range Bands",
-    hint: "JSON array of {label,min,max} in scene units.",
+    hint: "JSON array of {label,min,max} in scene units (units-agnostic).",
     scope: "world", config: true,
     default: JSON.stringify(DEFAULT_BANDS, null, 2), type: String
   });
@@ -42,14 +43,28 @@ Hooks.once("init", () => {
 
 /* ---------------- Helpers ---------------- */
 function getBands() {
-  try { const a = JSON.parse(game.settings.get(MODULE_ID, "bands")); return Array.isArray(a) ? a : DEFAULT_BANDS; }
-  catch { return DEFAULT_BANDS; }
+  try {
+    const raw = JSON.parse(game.settings.get(MODULE_ID, "bands"));
+    return Array.isArray(raw) ? raw : DEFAULT_BANDS;
+  } catch {
+    return DEFAULT_BANDS;
+  }
 }
+
+/** robust band lookup (sorted, numeric, gap-safe) */
 function bandFor(d) {
-  const arr = getBands();
-  for (const b of arr) if (d >= b.min && d <= b.max) return b.label;
-  return arr.length ? arr[arr.length - 1].label : String(d);
+  const arr = getBands()
+    .map(b => ({ label: String(b.label), min: Number(b.min), max: Number(b.max) }))
+    .filter(b => Number.isFinite(b.min) && Number.isFinite(b.max))
+    .sort((a, b) => a.min - b.min);
+
+  let chosen = arr.length ? arr[arr.length - 1].label : String(d);
+  for (const b of arr) {
+    if (d >= b.min && d <= b.max) { chosen = b.label; break; }
+  }
+  return chosen;
 }
+
 function parseNum(text) {
   const m = typeof text === "string" ? text.match(/(\d+(?:\.\d+)?)/) : null;
   return m ? Number(m[1]) : 0;
@@ -160,7 +175,7 @@ function patchPrototypeV13() {
   for (const proto of getRulerProtos()) {
     if (!proto) continue;
 
-    // Preferred: modify waypoint context for the HTML pill
+    // Preferred: modify the waypoint context for the HTML pill
     if (typeof proto._getWaypointLabelContext === "function" && !proto._rbrPatchedWLC) {
       const orig = proto._getWaypointLabelContext;
       proto._getWaypointLabelContext = function (...args) {
@@ -168,23 +183,23 @@ function patchPrototypeV13() {
         try {
           if (!ctx || !shouldBand(this)) return ctx;
 
-          // Keep distance numeric for the pill
+          // Keep distance numeric for v13's pill
           const dNum = typeof ctx.distance === "number"
             ? ctx.distance
             : (typeof args?.[0]?.distance === "number" ? args[0].distance : parseNum(String(ctx.distance)));
 
-          // Always start from scene units (plain), never reuse ctx.units (can persist formatted text)
+          // Always derive fresh plain units from the scene
           const sceneUnits = String(canvas?.scene?.grid?.units ?? ctx.units ?? "").trim();
           const band = bandFor(dNum);
 
+          if (DEBUG_RBR) console.log(`[${MODULE_ID}] d=${dNum} units=${sceneUnits} band=${band}`);
+
           if (game.settings.get(MODULE_ID, "showNumericFallback")) {
-            // Show "14.5 m • Near"
-            ctx.units = sceneUnits ? `${sceneUnits} • ${band}` : band;
-            // ctx.distance remains numeric
+            ctx.units = sceneUnits ? `${sceneUnits} • ${band}` : band;  // e.g. "m • Near"
+            // ctx.distance remains numeric so the pill shows "14.5 m • Near"
           } else {
-            // Show just "Near"
-            ctx.units = band;
-            ctx.distance = ""; // only prints units string in the pill
+            ctx.units = band;     // just "Near"
+            ctx.distance = "";    // hide numeric in the pill
           }
 
           if (game.settings.get(MODULE_ID, "hideBracketDistances") && typeof ctx.units === "string") {
@@ -200,7 +215,7 @@ function patchPrototypeV13() {
       console.log(`${MODULE_ID} | v13: patched _getWaypointLabelContext (units from scene + band)`);
     }
 
-    // Style-level safety net (some systems compose label text here)
+    // Safety net: some builds set text/label in segment style
     if (typeof proto._getSegmentStyle === "function" && !proto._rbrPatchedSegStyle) {
       const orig = proto._getSegmentStyle;
       proto._getSegmentStyle = function (...args) {
@@ -221,7 +236,7 @@ function patchPrototypeV13() {
       console.log(`${MODULE_ID} | v13: patched prototype via _getSegmentStyle`);
     }
 
-    // Last-resort: rewrite PIXI label nodes after refresh
+    // Last-resort: rewrite PIXI nodes after refresh
     if (typeof proto._refresh === "function" && !proto._rbrPatchedRefresh) {
       const orig = proto._refresh;
       proto._refresh = function (...args) {
