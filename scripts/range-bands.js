@@ -89,6 +89,18 @@ function getLabelNodes(ctx) {
   return [];
 }
 
+// Remove any previous "Band (...)" wrappers so we always rebuild from the raw numeric
+function stripBandWrappers(text) {
+  let t = String(text ?? "");
+  // unwrap up to 6 times to be safe (Near (Near (15 ft)))
+  for (let i = 0; i < 6; i++) {
+    const m = t.match(/^\s*[^()]+?\s*\((.*)\)\s*$/);
+    if (!m) break;
+    t = m[1];
+  }
+  return t.trim();
+}
+
 /** Replace label texts using segment distances when available (idempotent). */
 function postProcessLabels(ctx) {
   if (!shouldBand(ctx)) return;
@@ -96,22 +108,31 @@ function postProcessLabels(ctx) {
   const labelNodes = getLabelNodes(ctx);
   const segs = Array.isArray(ctx?.segments) ? ctx.segments : [];
 
-  // Build from segment distance if available, otherwise parse text
-  const build = (lab, segDist) => {
+  const apply = (lab, segDist) => {
     if (!lab || typeof lab.text !== "string") return;
-    const base = lab.text; // whatever Foundry just wrote (numeric distance)
+
+    // Start from the underlying numeric string (strip any earlier band wrappers)
+    let base = stripBandWrappers(lab.text);
+
+    // Optionally remove Foundry’s bracketed total before display
+    if (game.settings.get(MODULE_ID, "hideBracketDistances")) {
+      base = base.replace(/\[.*?\]/g, "").trim();
+    }
+
+    // Choose a numeric distance: prefer segment value, fallback to parsed number
     const d = (segDist ?? parseNum(base)) || 0;
-    lab.text = makeLabel(d, base);
+
+    // Rebuild label exactly once
+    lab.text = game.settings.get(MODULE_ID, "showNumericFallback")
+      ? `${bandFor(d)} (${base})`
+      : bandFor(d);
   };
 
   if (labelNodes.length && segs.length && labelNodes.length === segs.length) {
-    for (let i = 0; i < labelNodes.length; i++) {
-      build(labelNodes[i], segs[i]?.distance);
-    }
-    return;
+    for (let i = 0; i < labelNodes.length; i++) apply(labelNodes[i], segs[i]?.distance);
+  } else {
+    for (const lab of labelNodes) apply(lab, undefined);
   }
-
-  for (const lab of labelNodes) build(lab, undefined);
 }
 
 /** Patch a single ruler instance (idempotent). */
