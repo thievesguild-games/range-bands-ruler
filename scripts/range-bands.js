@@ -1,5 +1,5 @@
 // ============================================================================
-// Range Bands Ruler  —  v1.5.25
+// Range Bands Ruler  —  v1.6.0
 // Thieves Guild Games
 //
 // v12 + v13 support. For v13 we:
@@ -19,7 +19,7 @@
 // ============================================================================
 
 const MODULE_ID = "range-bands-ruler";
-const DEBUG_RBR = true; // keep on while verifying
+const DEBUG_RBR = false; // keep on while verifying
 
 const gp = (obj, path) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(obj, path) : undefined);
 
