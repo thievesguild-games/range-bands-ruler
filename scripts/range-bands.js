@@ -1,30 +1,25 @@
 // ============================================================================
-// Range Bands Ruler  —  v1.5.20
+// Range Bands Ruler  —  v1.5.21
 // Thieves Guild Games
 //
-// Works with Foundry VTT v12 and v13
-// v13 changes:
-//  - Monkey-patches Ruler prototype directly (no libWrapper), avoiding
-//    "Parameter 'target' must be a number or a string" registration errors.
-//  - Computes distance from segment.ray.distance (pixels) -> scene units.
-//  - Builds pill as "14.5 m • Near" (or just "Near" if you disable numeric).
-//
-// v12:
-//  - Post-processes PIXI ruler labels after measurement and tooltip refresh.
+// v12 + v13 support with robust distance recovery for the pill.
+// v13 strategy order:
+//  1) last segment.ray.distance (pixels -> scene units)
+//  2) sum of segments if available
+//  3) origin/first waypoint  -> ctx.position (pixels -> scene units)
+//  4) logs deep debug if still 0 to show what's missing
 //
 // Settings:
-//   - bands (world, JSON of {label, min, max} in scene units)
+//   - bands (world, JSON of {label,min,max})
 //   - showNumericFallback (client)
 //   - hideBracketDistances (client)
 //   - bandWhenSnappedOnly (client)
-// Debugging:
-//   - DEBUG_RBR = true (left ON here) logs d/units/band while you drag.
 // ============================================================================
 
 const MODULE_ID = "range-bands-ruler";
-const DEBUG_RBR = true; // keep ON until you're satisfied
+const DEBUG_RBR = true; // keep on for now
 
-const gp = (obj, path) => foundry?.utils?.getProperty ? foundry.utils.getProperty(obj, path) : undefined;
+const gp = (obj, path) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(obj, path) : undefined);
 
 /* ---------------- Settings ---------------- */
 
@@ -77,7 +72,7 @@ function getBands() {
         .filter(b => Number.isFinite(b.min) && Number.isFinite(b.max))
         .sort((a, b) => a.min - b.min);
     }
-  } catch {/* ignore */}
+  } catch {}
   return DEFAULT_BANDS;
 }
 
@@ -120,35 +115,62 @@ function getSceneUnits() {
   return String(canvas?.scene?.grid?.units ?? "").trim();
 }
 
-/** v13: compute live distance from segments/waypoints */
-function computeLiveDistanceV13(ruler) {
+/* ---------------- Distance recovery (v13) ---------------- */
+
+/** Normalize anything iterable/array-like into a simple array of points with x/y. */
+function toPointArray(maybe) {
+  if (!maybe) return [];
+  if (Array.isArray(maybe)) return maybe;
+  try {
+    if (typeof maybe[Symbol.iterator] === "function") return Array.from(maybe);
+  } catch {}
+  // PIXI containers with children?
+  if (maybe.children && Array.isArray(maybe.children)) return maybe.children;
+  return [];
+}
+
+/** Try several strategies to get the current distance in scene units. */
+function computeLiveDistanceV13(ruler, ctxPosition) {
   const dim = canvas?.dimensions;
   if (!dim) return 0;
+  const upp = (dim.distance ?? 1) / (dim.size ?? 1);
 
-  const unitsPerPixel = (dim.distance ?? 1) / (dim.size ?? 1);
-
-  // Sum all segment distances if present
+  // A) last segment’s ray.distance (pixels)
   const segs = ruler?.segments;
   if (Array.isArray(segs) && segs.length) {
-    let total = 0;
-    for (const s of segs) {
-      if (s?.ray?.distance != null) total += s.ray.distance * unitsPerPixel; // v13 preferred
-      else if (typeof s?.distance === "number") total += s.distance;         // v12 fallback
+    const last = segs[segs.length - 1];
+    if (last?.ray?.distance != null) {
+      return last.ray.distance * upp;
     }
-    if (total > 0) return total;
+    // or sum up any numeric distances we find
+    let sum = 0;
+    for (const s of segs) {
+      if (s?.ray?.distance != null) sum += s.ray.distance * upp;
+      else if (typeof s?.distance === "number") sum += s.distance;
+    }
+    if (sum > 0) return sum;
   }
 
-  // Fallback: straight line from first to last waypoint
-  const wps = ruler?.waypoints;
-  if (Array.isArray(wps) && wps.length >= 2) {
-    const a = wps[0], b = wps[wps.length - 1];
-    const dx = (b.x ?? 0) - (a.x ?? 0);
-    const dy = (b.y ?? 0) - (a.y ?? 0);
+  // B) Use origin/first waypoint to current ctx.position
+  const wps = toPointArray(ruler?.waypoints);
+  let start = wps.length ? wps[0] : null;
+  if (!start) start = ruler?.origin || ruler?._origin || ruler?._from || null;
+
+  const end = ctxPosition || ruler?._to || ruler?.destination || null;
+
+  if (start && end && (end.x != null) && (end.y != null) && (start.x != null) && (start.y != null)) {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
     const pixels = Math.hypot(dx, dy);
-    const units  = pixels * unitsPerPixel;
-    if (units > 0) return units;
+    return pixels * upp;
   }
 
+  if (DEBUG_RBR) {
+    console.log(`[${MODULE_ID}] DEBUG: could not compute distance. segs=`,
+      { count: Array.isArray(segs) ? segs.length : typeof segs, lastRay: segs?.at?.(-1)?.ray },
+      " waypoints=", { type: typeof ruler?.waypoints, len: toPointArray(ruler?.waypoints).length },
+      " start=", start, " end(ctx.position)=", ctxPosition);
+  }
   return 0;
 }
 
@@ -240,7 +262,6 @@ function patchPrototypeV13() {
   }
   const proto = R.prototype;
 
-  // Patch the pill context (preferred)
   if (typeof proto._getWaypointLabelContext === "function" && !proto._rbrPatchedWLC) {
     const orig = proto._getWaypointLabelContext;
     proto._getWaypointLabelContext = function (...args) {
@@ -249,7 +270,7 @@ function patchPrototypeV13() {
         if (!ctx || !shouldBand(this)) return ctx;
 
         let d = (typeof ctx.distance === "number" ? ctx.distance : 0);
-        if (!d || d <= 0) d = computeLiveDistanceV13(this);
+        if (!d || d <= 0) d = computeLiveDistanceV13(this, ctx.position);
 
         const units = getSceneUnits();
         const band  = bandFor(d);
@@ -257,10 +278,10 @@ function patchPrototypeV13() {
         if (DEBUG_RBR) console.log(`[${MODULE_ID}] d=${d} units=${units} band=${band}`);
 
         if (game.settings.get(MODULE_ID, "showNumericFallback")) {
-          ctx.units = units ? `${units} • ${band}` : band;   // pill: 14.5 m • Near
+          ctx.units = units ? `${units} • ${band}` : band;
         } else {
-          ctx.units = band;                                  // pill: Near
-          ctx.distance = "";                                 // hide numeric in pill
+          ctx.units = band;
+          ctx.distance = "";
         }
 
         if (game.settings.get(MODULE_ID, "hideBracketDistances") && typeof ctx.units === "string") {
@@ -275,7 +296,6 @@ function patchPrototypeV13() {
     console.log(`${MODULE_ID} | v13: patched via _getWaypointLabelContext`);
   }
 
-  // Fallback: rewrite PIXI labels after refresh (rarely used on v13)
   if (typeof proto._refresh === "function" && !proto._rbrPatchedRefresh) {
     const orig = proto._refresh;
     proto._refresh = function (...args) {
