@@ -1,8 +1,8 @@
-// Range Bands Ruler — v1.5.14
-// Works on Foundry v12 & v13
+// Range Bands Ruler — v1.5.15
+// v12 & v13 support with reliable live distance for v13
 
 const MODULE_ID = "range-bands-ruler";
-// Flip to true to log distances/bands while testing v13
+// Set true while testing to log distance/band each time the pill updates
 const DEBUG_RBR = true;
 
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
@@ -104,6 +104,34 @@ function isV13Plus() {
   return Number.isFinite(gen) ? gen >= 13 : (Number((game?.version || "0").split(".")[0]) >= 13);
 }
 
+/** v13 helper: compute current distance if ctx.distance is missing/0 */
+function getLiveDistance(ruler) {
+  // 1) latest segment distance
+  const segs = ruler?.segments;
+  if (Array.isArray(segs) && segs.length) {
+    const last = segs[segs.length - 1];
+    if (typeof last?.distance === "number" && last.distance > 0) return last.distance;
+    const sum = segs.reduce((a, s) => a + (typeof s.distance === "number" ? s.distance : 0), 0);
+    if (sum > 0) return sum;
+  }
+
+  // 2) fallback: compute from waypoints in pixels -> scene units
+  const wps = ruler?.waypoints;
+  if (Array.isArray(wps) && wps.length >= 2) {
+    const a = wps[0], b = wps[wps.length - 1];
+    if (a && b) {
+      const dx = (b.x ?? 0) - (a.x ?? 0);
+      const dy = (b.y ?? 0) - (a.y ?? 0);
+      const pixels = Math.hypot(dx, dy);
+      const distPerPx = (canvas?.dimensions?.distance ?? 1) / (canvas?.dimensions?.size ?? 1);
+      const units = pixels * distPerPx;
+      if (units > 0) return units;
+    }
+  }
+
+  return 0;
+}
+
 /* ---------------- v12: instance post-process ---------------- */
 function postProcessLabelsV12(ctx) {
   if (!shouldBand(ctx)) return;
@@ -175,7 +203,7 @@ function patchPrototypeV13() {
   for (const proto of getRulerProtos()) {
     if (!proto) continue;
 
-    // Preferred: modify the waypoint context for the HTML pill
+    // Preferred: modify waypoint context for the HTML pill
     if (typeof proto._getWaypointLabelContext === "function" && !proto._rbrPatchedWLC) {
       const orig = proto._getWaypointLabelContext;
       proto._getWaypointLabelContext = function (...args) {
@@ -183,23 +211,22 @@ function patchPrototypeV13() {
         try {
           if (!ctx || !shouldBand(this)) return ctx;
 
-          // Keep distance numeric for v13's pill
-          const dNum = typeof ctx.distance === "number"
-            ? ctx.distance
-            : (typeof args?.[0]?.distance === "number" ? args[0].distance : parseNum(String(ctx.distance)));
+          // Keep distance numeric; if it's 0/undefined, compute it live from the ruler
+          let dNum = (typeof ctx.distance === "number" ? ctx.distance : 0);
+          if (!dNum || dNum <= 0) dNum = getLiveDistance(this);
 
-          // Always derive fresh plain units from the scene
+          // Derive plain units from scene, never reuse formatted ctx.units
           const sceneUnits = String(canvas?.scene?.grid?.units ?? ctx.units ?? "").trim();
           const band = bandFor(dNum);
 
           if (DEBUG_RBR) console.log(`[${MODULE_ID}] d=${dNum} units=${sceneUnits} band=${band}`);
 
           if (game.settings.get(MODULE_ID, "showNumericFallback")) {
-            ctx.units = sceneUnits ? `${sceneUnits} • ${band}` : band;  // e.g. "m • Near"
-            // ctx.distance remains numeric so the pill shows "14.5 m • Near"
+            ctx.units = sceneUnits ? `${sceneUnits} • ${band}` : band;  // pill: "14.5 m • Near"
+            // ctx.distance remains numeric
           } else {
-            ctx.units = band;     // just "Near"
-            ctx.distance = "";    // hide numeric in the pill
+            ctx.units = band;   // pill: "Near"
+            ctx.distance = "";  // show only the band
           }
 
           if (game.settings.get(MODULE_ID, "hideBracketDistances") && typeof ctx.units === "string") {
@@ -212,7 +239,7 @@ function patchPrototypeV13() {
       };
       proto._rbrPatchedWLC = true;
       patchedAny = true;
-      console.log(`${MODULE_ID} | v13: patched _getWaypointLabelContext (units from scene + band)`);
+      console.log(`${MODULE_ID} | v13: patched _getWaypointLabelContext (live distance)`);
     }
 
     // Safety net: some builds set text/label in segment style
