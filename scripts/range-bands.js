@@ -1,4 +1,4 @@
-// Range Bands Ruler — v1.5.5
+// Range Bands Ruler — v1.5.6
 // v12: instance post-process (works as you have today)
 // v13+: patch _getWaypointLabelContext to rewrite label text
 
@@ -135,63 +135,125 @@ function tryPatchCurrentRuler_v12() {
 }
 
 /* ---------------- v13: patch _getWaypointLabelContext ---------------- */
-// --- replace existing v13 patch + lifecycle with this ---
-
-function patchPrototype_v13_all() {
-  const classes = [
-    gp(foundry, "canvas.interaction.Ruler"),
-    gp(CONFIG, "Canvas.rulerClass"),
+// ===== v13 definitive patch (replace previous v13 patch + hooks) =====
+function _rbrGetRulerProtos() {
+  const candidates = [
+    foundry?.canvas?.interaction?.Ruler,
+    CONFIG?.Canvas?.rulerClass,
     globalThis.Ruler
   ].filter(Boolean);
+  return candidates.map(C => C && C.prototype).filter(Boolean);
+}
 
+function _rbrLogProto(proto) {
+  try {
+    const desc = Object.getOwnPropertyDescriptors(proto);
+    const methods = Object.entries(desc).filter(([,d]) => typeof d.value === "function").map(([k]) => k).sort();
+    console.log(`${MODULE_ID} | v13: Ruler.prototype methods:`, methods);
+  } catch {}
+}
+
+function patchPrototype_v13_definitive() {
   let patched = false;
 
-  for (const R of classes) {
-    const proto = R?.prototype;
-    if (!proto || proto._rbrPatchedWLC) continue;
+  for (const proto of _rbrGetRulerProtos()) {
+    if (!proto || proto._rbrPatchedV13) continue;
+    _rbrLogProto(proto);
 
+    // 1) Best: rewrite label context before it becomes PIXI text
     if (typeof proto._getWaypointLabelContext === "function") {
       const orig = proto._getWaypointLabelContext;
       proto._getWaypointLabelContext = function (...args) {
         const ctx = orig.apply(this, args);
         try {
           if (!ctx || typeof ctx.text !== "string" || !shouldBand(this)) return ctx;
-
-          // Try to get a numeric distance directly from args/context; otherwise parse the text.
-          const maybeDist =
-            (args && typeof args[0]?.distance === "number" ? args[0].distance : undefined) ??
-            (typeof ctx.distance === "number" ? ctx.distance : undefined);
-
-          const baseText = cleanBaseText(ctx.text.replace(/\s+$/, ""));
-          const numeric = typeof maybeDist === "number" ? maybeDist : parseNum(baseText);
-          ctx.text = makeBandedLabel(numeric, baseText);
-        } catch (e) {
-          console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext patch failed`, e);
-        }
+          // Prefer structured distance if provided, else parse text
+          const argDist = typeof args?.[0]?.distance === "number" ? args[0].distance : undefined;
+          const ctxDist = typeof ctx.distance === "number" ? ctx.distance : undefined;
+          const base    = cleanBaseText(ctx.text);
+          const d       = (argDist ?? ctxDist ?? parseNum(base)) || 0;
+          ctx.text = makeBandedLabel(d, base);
+        } catch (e) { console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext patch failed`, e); }
         return ctx;
       };
-      proto._rbrPatchedWLC = true;
-      console.log(`${MODULE_ID} | v13: patched prototype via _getWaypointLabelContext on`, R?.name || "(anonymous Ruler)");
+      proto._rbrPatchedV13 = true;
       patched = true;
+      console.log(`${MODULE_ID} | v13: patched prototype via _getWaypointLabelContext`);
+      continue;
     }
+
+    // 2) Fallback: segment style often includes label text; rewrite it
+    if (typeof proto._getSegmentStyle === "function") {
+      const orig = proto._getSegmentStyle;
+      proto._getSegmentStyle = function (...args) {
+        const style = orig.apply(this, args) ?? {};
+        try {
+          if (!shouldBand(this)) return style;
+          // Some builds include { label: "60 ft [60 ft]" } or { text: "..." }
+          const labelKey = "label" in style ? "label" : ("text" in style ? "text" : null);
+          if (labelKey && typeof style[labelKey] === "string") {
+            const base = cleanBaseText(style[labelKey]);
+            const d    = parseNum(base);
+            style[labelKey] = makeBandedLabel(d, base);
+          }
+        } catch (e) { console.warn(`${MODULE_ID} | v13 _getSegmentStyle patch failed`, e); }
+        return style;
+      };
+      proto._rbrPatchedV13 = true;
+      patched = true;
+      console.log(`${MODULE_ID} | v13: patched prototype via _getSegmentStyle`);
+      continue;
+    }
+
+    // 3) Last resort: after each refresh, rewrite any label text we can see
+    if (typeof proto._refresh === "function") {
+      const orig = proto._refresh;
+      proto._refresh = function (...args) {
+        const out = orig.apply(this, args);
+        try {
+          const nodes = (this?.labels?.children && Array.isArray(this.labels.children)) ? this.labels.children
+                      : (this?.tooltips?.children && Array.isArray(this.tooltips.children)) ? this.tooltips.children
+                      : [];
+          if (nodes.length && shouldBand(this)) {
+            for (const lab of nodes) {
+              if (!lab || typeof lab.text !== "string") continue;
+              const base = cleanBaseText(lab.text);
+              const d    = parseNum(base);
+              lab.text   = makeBandedLabel(d, base);
+            }
+          }
+        } catch (e) { console.warn(`${MODULE_ID} | v13 prototype _refresh fallback failed`, e); }
+        return out;
+      };
+      proto._rbrPatchedV13 = true;
+      patched = true;
+      console.log(`${MODULE_ID} | v13: patched prototype via _refresh (fallback)`);
+      continue;
+    }
+
+    console.warn(`${MODULE_ID} | v13: no usable methods on this Ruler prototype; trying others.`);
   }
 
-  if (!patched) {
-    console.warn(`${MODULE_ID} | v13: _getWaypointLabelContext not found on any Ruler prototype; will retry later.`);
-  }
-
+  if (!patched) console.warn(`${MODULE_ID} | v13: could not patch any Ruler prototype; will retry.`);
   return patched;
 }
 
-function isV13Plus() {
-  const gen = Number(gp(game, "release.generation"));
-  return Number.isFinite(gen) ? gen >= 13 : (Number(gp(game, "version")?.split?.(".")?.[0]) >= 13);
+// Retry points — some systems assign the Ruler class late
+function _rbrTryPatchV13WithRetries() {
+  let ok = patchPrototype_v13_definitive();
+  if (ok) return;
+  setTimeout(() => patchPrototype_v13_definitive(), 200);
+  Hooks.once("renderSceneControls", () => patchPrototype_v13_definitive());
 }
 
-// Try early, then retry after scene controls render (many systems set ruler class then).
-Hooks.once("ready", () => { if (isV13Plus()) patchPrototype_v13_all(); });
-Hooks.on("canvasReady", () => { if (isV13Plus()) patchPrototype_v13_all(); });
-Hooks.on("renderSceneControls", () => { if (isV13Plus()) patchPrototype_v13_all(); });
+// Replace your previous v13 lifecycle with these:
+function isV13Plus() {
+  const gen = Number(foundry?.game?.release?.generation ?? game?.release?.generation);
+  return Number.isFinite(gen) ? gen >= 13 : (Number((game?.version || "0").split(".")[0]) >= 13);
+}
+Hooks.once("ready", () => { if (isV13Plus()) _rbrTryPatchV13WithRetries(); });
+Hooks.on("canvasReady", () => { if (isV13Plus()) _rbrTryPatchV13WithRetries(); });
+// ===== end v13 definitive patch =====
 
 /* ---------------- v13 fallback: patch instance via _refresh ---------------- */
 function patchInstance_v13_fallback(ruler) {
