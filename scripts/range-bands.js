@@ -1,4 +1,4 @@
-// Range Bands Ruler — v1.5.7
+// Range Bands Ruler — v1.5.8
 // v12: instance post-process of label text (tooltips/measure)
 // v13+: patch the Ruler prototype (preferred: _getWaypointLabelContext;
 //       fallback: _getSegmentStyle; last resort: prototype _refresh)
@@ -155,34 +155,89 @@ function rbrGetRulerProtos() {
   return candidates.map(C => C && C.prototype).filter(Boolean);
 }
 function rbrPatchPrototypeV13() {
-  let patched = false;
+  let patchedAny = false;
 
   for (const proto of rbrGetRulerProtos()) {
-    if (!proto || proto._rbrPatchedV13) continue;
+    if (!proto) continue;
 
-    // Preferred: rewrite the context that contains label text.
-    if (typeof proto._getWaypointLabelContext === "function") {
+    // We want to try both patches if available; track individually.
+    const already = proto._rbrPatchedV13Flags || {};
+    const flags = { ...already };
+
+    // --- Helper to apply band text to a variety of ctx shapes ---
+    const applyToContext = (ctx, distanceGuess) => {
+      if (!ctx) return ctx;
+      // one-time debug: print shape the first time we see it
+      if (!flags._debuggedCtx) {
+        try {
+          const keys = Object.keys(ctx);
+          console.log(`${MODULE_ID} | v13 debug: _getWaypointLabelContext keys ->`, keys);
+        } catch {}
+        flags._debuggedCtx = true;
+      }
+
+      // Accept several shapes:
+      //  - { text: "60 ft [60 ft]" }
+      //  - { label: "..." }
+      //  - { lines: ["...", "..."] } or { texts: [...] }
+      const key =
+        (typeof ctx.text === "string" && "text") ||
+        (typeof ctx.label === "string" && "label") ||
+        (Array.isArray(ctx.lines) && "lines") ||
+        (Array.isArray(ctx.texts) && "texts") ||
+        null;
+
+      if (!key) return ctx;
+
+      const setValue = (s) => {
+        if (key === "text" || key === "label") ctx[key] = s;
+        else if (key === "lines" || key === "texts") {
+          // usually last element is the distance string
+          const arr = ctx[key];
+          if (arr.length) arr[arr.length - 1] = s;
+        }
+      };
+
+      const getValue = () => {
+        if (key === "text" || key === "label") return ctx[key];
+        const arr = ctx[key];
+        return arr.length ? String(arr[arr.length - 1]) : "";
+      };
+
+      // Base numeric and string
+      const baseRaw = rbrStripBandWrappers(String(getValue() ?? ""));
+      const base = rbrCleanBase(baseRaw);
+      const d =
+        (typeof distanceGuess === "number" ? distanceGuess : undefined) ??
+        (typeof ctx.distance === "number" ? ctx.distance : undefined) ??
+        rbrParseNum(base);
+
+      setValue(rbrMakeLabel(d || 0, base));
+      return ctx;
+    };
+
+    // ---- Patch _getWaypointLabelContext (preferred) ----
+    if (typeof proto._getWaypointLabelContext === "function" && !flags.wlc) {
       const orig = proto._getWaypointLabelContext;
       proto._getWaypointLabelContext = function (...args) {
         const ctx = orig.apply(this, args);
         try {
-          if (!ctx || typeof ctx.text !== "string" || !rbrShouldBand(this)) return ctx;
+          if (!rbrShouldBand(this)) return ctx;
+          // distance may be args[0]?.distance on some builds
           const argDist = typeof args?.[0]?.distance === "number" ? args[0].distance : undefined;
-          const ctxDist = typeof ctx.distance === "number" ? ctx.distance : undefined;
-          const base    = rbrCleanBase(rbrStripBandWrappers(ctx.text));
-          const d       = (argDist ?? ctxDist ?? rbrParseNum(base)) || 0;
-          ctx.text = rbrMakeLabel(d, base);
-        } catch (e) { console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext patch failed`, e); }
-        return ctx;
+          return applyToContext(ctx, argDist);
+        } catch (e) {
+          console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext patch failed`, e);
+          return ctx;
+        }
       };
-      proto._rbrPatchedV13 = true;
-      patched = true;
+      flags.wlc = true;
+      patchedAny = true;
       console.log(`${MODULE_ID} | v13: patched prototype via _getWaypointLabelContext`);
-      continue;
     }
 
-    // Fallback: some builds expose a segment style with text/label
-    if (typeof proto._getSegmentStyle === "function") {
+    // ---- Patch _getSegmentStyle too (to avoid later overwrite) ----
+    if (typeof proto._getSegmentStyle === "function" && !flags.seg) {
       const orig = proto._getSegmentStyle;
       proto._getSegmentStyle = function (...args) {
         const style = orig.apply(this, args) ?? {};
@@ -191,47 +246,25 @@ function rbrPatchPrototypeV13() {
           const key = "label" in style ? "label" : ("text" in style ? "text" : null);
           if (key && typeof style[key] === "string") {
             const base = rbrCleanBase(rbrStripBandWrappers(style[key]));
-            const d    = rbrParseNum(base);
-            style[key] = rbrMakeLabel(d, base);
+            const d = rbrParseNum(base);
+            style[key] = rbrMakeLabel(d || 0, base);
           }
-        } catch (e) { console.warn(`${MODULE_ID} | v13 _getSegmentStyle patch failed`, e); }
+        } catch (e) {
+          console.warn(`${MODULE_ID} | v13 _getSegmentStyle patch failed`, e);
+        }
         return style;
       };
-      proto._rbrPatchedV13 = true;
-      patched = true;
+      flags.seg = true;
+      patchedAny = true;
       console.log(`${MODULE_ID} | v13: patched prototype via _getSegmentStyle`);
-      continue;
     }
 
-    // Last resort: after each refresh, walk any PIXI text nodes and rewrite
-    if (typeof proto._refresh === "function") {
-      const orig = proto._refresh;
-      proto._refresh = function (...args) {
-        const out = orig.apply(this, args);
-        try {
-          const nodes = (this?.labels?.children && Array.isArray(this.labels.children)) ? this.labels.children
-                      : (this?.tooltips?.children && Array.isArray(this.tooltips.children)) ? this.tooltips.children
-                      : [];
-          if (nodes.length && rbrShouldBand(this)) {
-            for (const lab of nodes) {
-              if (!lab || typeof lab.text !== "string") continue;
-              const base = rbrCleanBase(rbrStripBandWrappers(lab.text));
-              const d    = rbrParseNum(base);
-              lab.text   = rbrMakeLabel(d, base);
-            }
-          }
-        } catch (e) { console.warn(`${MODULE_ID} | v13 prototype _refresh fallback failed`, e); }
-        return out;
-      };
-      proto._rbrPatchedV13 = true;
-      patched = true;
-      console.log(`${MODULE_ID} | v13: patched prototype via _refresh (fallback)`);
-      continue;
-    }
+    // Save flags so we don’t double-patch this prototype.
+    proto._rbrPatchedV13Flags = flags;
   }
 
-  if (!patched) console.warn(`${MODULE_ID} | v13: could not patch any Ruler prototype; will retry.`);
-  return patched;
+  if (!patchedAny) console.warn(`${MODULE_ID} | v13: could not patch any Ruler prototype; will retry.`);
+  return patchedAny;
 }
 
 /* ---------------- lifecycle ---------------- */
