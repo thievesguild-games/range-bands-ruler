@@ -1,4 +1,4 @@
-// Range Bands Ruler — v1.5.4
+// Range Bands Ruler — v1.5.5
 // v12: instance post-process (works as you have today)
 // v13+: patch _getWaypointLabelContext to rewrite label text
 
@@ -135,43 +135,63 @@ function tryPatchCurrentRuler_v12() {
 }
 
 /* ---------------- v13: patch _getWaypointLabelContext ---------------- */
-function patchPrototype_v13_exact() {
-  const RulerClass = gp(foundry, "canvas.interaction.Ruler") || gp(CONFIG, "Canvas.rulerClass") || globalThis.Ruler;
-  if (!RulerClass) { console.warn(`${MODULE_ID} | v13: No Ruler class found.`); return false; }
+// --- replace existing v13 patch + lifecycle with this ---
 
-  const proto = RulerClass.prototype;
+function patchPrototype_v13_all() {
+  const classes = [
+    gp(foundry, "canvas.interaction.Ruler"),
+    gp(CONFIG, "Canvas.rulerClass"),
+    globalThis.Ruler
+  ].filter(Boolean);
 
-  // This exists on your build (from your dump):
-  if (typeof proto._getWaypointLabelContext === "function" && proto._rbrPatchedWLC !== true) {
-    const orig = proto._getWaypointLabelContext;
-    proto._getWaypointLabelContext = function (...args) {
-      // The original returns an object like { text, ... }  — we’ll rewrite text.
-      const ctx = orig.apply(this, args);
-      try {
-        if (!shouldBand(this) || !ctx || typeof ctx.text !== "string") return ctx;
+  let patched = false;
 
-        // Prefer a numeric from args/ctx if present
-        // Common shapes seen: args[0]?.distance or ctx.distance
-        const maybeDist =
-          (args && typeof args[0]?.distance === "number" ? args[0].distance : undefined) ??
-          (typeof ctx.distance === "number" ? ctx.distance : undefined);
+  for (const R of classes) {
+    const proto = R?.prototype;
+    if (!proto || proto._rbrPatchedWLC) continue;
 
-        const base = cleanBaseText(stripBandWrappers(ctx.text));
-        const d = (typeof maybeDist === "number" ? maybeDist : parseNum(base)) || 0;
-        ctx.text = makeBandedLabel(d, base);
-      } catch (e) {
-        console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext patch failed`, e);
-      }
-      return ctx;
-    };
-    proto._rbrPatchedWLC = true;
-    console.log(`${MODULE_ID} | v13: patched prototype via _getWaypointLabelContext`);
-    return true;
+    if (typeof proto._getWaypointLabelContext === "function") {
+      const orig = proto._getWaypointLabelContext;
+      proto._getWaypointLabelContext = function (...args) {
+        const ctx = orig.apply(this, args);
+        try {
+          if (!ctx || typeof ctx.text !== "string" || !shouldBand(this)) return ctx;
+
+          // Try to get a numeric distance directly from args/context; otherwise parse the text.
+          const maybeDist =
+            (args && typeof args[0]?.distance === "number" ? args[0].distance : undefined) ??
+            (typeof ctx.distance === "number" ? ctx.distance : undefined);
+
+          const baseText = cleanBaseText(ctx.text.replace(/\s+$/, ""));
+          const numeric = typeof maybeDist === "number" ? maybeDist : parseNum(baseText);
+          ctx.text = makeBandedLabel(numeric, baseText);
+        } catch (e) {
+          console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext patch failed`, e);
+        }
+        return ctx;
+      };
+      proto._rbrPatchedWLC = true;
+      console.log(`${MODULE_ID} | v13: patched prototype via _getWaypointLabelContext on`, R?.name || "(anonymous Ruler)");
+      patched = true;
+    }
   }
 
-  console.warn(`${MODULE_ID} | v13: _getWaypointLabelContext not found on prototype.`);
-  return false;
+  if (!patched) {
+    console.warn(`${MODULE_ID} | v13: _getWaypointLabelContext not found on any Ruler prototype; will retry later.`);
+  }
+
+  return patched;
 }
+
+function isV13Plus() {
+  const gen = Number(gp(game, "release.generation"));
+  return Number.isFinite(gen) ? gen >= 13 : (Number(gp(game, "version")?.split?.(".")?.[0]) >= 13);
+}
+
+// Try early, then retry after scene controls render (many systems set ruler class then).
+Hooks.once("ready", () => { if (isV13Plus()) patchPrototype_v13_all(); });
+Hooks.on("canvasReady", () => { if (isV13Plus()) patchPrototype_v13_all(); });
+Hooks.on("renderSceneControls", () => { if (isV13Plus()) patchPrototype_v13_all(); });
 
 /* ---------------- v13 fallback: patch instance via _refresh ---------------- */
 function patchInstance_v13_fallback(ruler) {
