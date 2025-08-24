@@ -1,8 +1,8 @@
-// Range Bands Ruler — v1.5.16
-// v12 & v13 support with reliable live distance for v13
+// Range Bands Ruler — v1.5.17
+// v12 + v13, with robust distance caching for v13 pills
 
 const MODULE_ID = "range-bands-ruler";
-// Set true while testing to log distance/band each time the pill updates
+// Turn on while testing to see the distance and band in the console
 const DEBUG_RBR = true;
 
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
@@ -104,32 +104,13 @@ function isV13Plus() {
   return Number.isFinite(gen) ? gen >= 13 : (Number((game?.version || "0").split(".")[0]) >= 13);
 }
 
-/** v13 helper: compute current distance if ctx.distance is missing/0 */
-function getLiveDistance(ruler) {
-  // 1) latest segment distance
-  const segs = ruler?.segments;
-  if (Array.isArray(segs) && segs.length) {
-    const last = segs[segs.length - 1];
-    if (typeof last?.distance === "number" && last.distance > 0) return last.distance;
-    const sum = segs.reduce((a, s) => a + (typeof s.distance === "number" ? s.distance : 0), 0);
-    if (sum > 0) return sum;
-  }
-
-  // 2) fallback: compute from waypoints in pixels -> scene units
-  const wps = ruler?.waypoints;
-  if (Array.isArray(wps) && wps.length >= 2) {
-    const a = wps[0], b = wps[wps.length - 1];
-    if (a && b) {
-      const dx = (b.x ?? 0) - (a.x ?? 0);
-      const dy = (b.y ?? 0) - (a.y ?? 0);
-      const pixels = Math.hypot(dx, dy);
-      const distPerPx = (canvas?.dimensions?.distance ?? 1) / (canvas?.dimensions?.size ?? 1);
-      const units = pixels * distPerPx;
-      if (units > 0) return units;
-    }
-  }
-
-  return 0;
+/* ---- v13 distance cache (shared across hooks) ---- */
+let LAST_DISTANCE = 0; // in scene units
+function setLastDistance(d) {
+  if (Number.isFinite(d) && d > 0) LAST_DISTANCE = d;
+}
+function getLastDistance() {
+  return LAST_DISTANCE || 0;
 }
 
 /* ---------------- v12: instance post-process ---------------- */
@@ -211,11 +192,10 @@ function patchPrototypeV13() {
         try {
           if (!ctx || !shouldBand(this)) return ctx;
 
-          // Keep distance numeric; if it's 0/undefined, compute it live from the ruler
-          let dNum = (typeof ctx.distance === "number" ? ctx.distance : 0);
-          if (!dNum || dNum >= 0) dNum = getLiveDistance(this);
+          // Some builds pass distance later; fall back to our cached value.
+          let dNum = (typeof ctx.distance === "number" ? ctx.distance : 0) || getLastDistance();
 
-          // Derive plain units from scene, never reuse formatted ctx.units
+          // Derive plain units from scene (don't reuse formatted ctx.units)
           const sceneUnits = String(canvas?.scene?.grid?.units ?? ctx.units ?? "").trim();
           const band = bandFor(dNum);
 
@@ -223,7 +203,7 @@ function patchPrototypeV13() {
 
           if (game.settings.get(MODULE_ID, "showNumericFallback")) {
             ctx.units = sceneUnits ? `${sceneUnits} • ${band}` : band;  // pill: "14.5 m • Near"
-            // ctx.distance remains numeric
+            // ctx.distance remains numeric (could be last cached)
           } else {
             ctx.units = band;   // pill: "Near"
             ctx.distance = "";  // show only the band
@@ -239,20 +219,22 @@ function patchPrototypeV13() {
       };
       proto._rbrPatchedWLC = true;
       patchedAny = true;
-      console.log(`${MODULE_ID} | v13: patched _getWaypointLabelContext (live distance)`);
+      console.log(`${MODULE_ID} | v13: patched _getWaypointLabelContext (using cached distance)`);
     }
 
-    // Safety net: some builds set text/label in segment style
+    // Safety net 1: some systems compose label text in segment style.
     if (typeof proto._getSegmentStyle === "function" && !proto._rbrPatchedSegStyle) {
       const orig = proto._getSegmentStyle;
       proto._getSegmentStyle = function (...args) {
         const style = orig.apply(this, args) ?? {};
         try {
           if (!shouldBand(this)) return style;
+
           const key = "label" in style ? "label" : ("text" in style ? "text" : null);
           if (key && typeof style[key] === "string") {
             const base = cleanBase(stripBandWrappers(style[key]));
             const d    = parseNum(base);
+            setLastDistance(d); // <-- cache numeric for pill
             style[key] = makeBanded(d || 0, base);
           }
         } catch (e) { console.warn(`${MODULE_ID} | v13 _getSegmentStyle patch failed`, e); }
@@ -260,10 +242,10 @@ function patchPrototypeV13() {
       };
       proto._rbrPatchedSegStyle = true;
       patchedAny = true;
-      console.log(`${MODULE_ID} | v13: patched prototype via _getSegmentStyle`);
+      console.log(`${MODULE_ID} | v13: patched prototype via _getSegmentStyle (caching distance)`);
     }
 
-    // Last-resort: rewrite PIXI nodes after refresh
+    // Safety net 2: rewrite PIXI nodes after refresh and cache numeric
     if (typeof proto._refresh === "function" && !proto._rbrPatchedRefresh) {
       const orig = proto._refresh;
       proto._refresh = function (...args) {
@@ -277,6 +259,7 @@ function patchPrototypeV13() {
             if (!lab || typeof lab.text !== "string") continue;
             const base = cleanBase(stripBandWrappers(lab.text));
             const d    = parseNum(base);
+            setLastDistance(d); // <-- cache numeric for pill
             lab.text   = makeBanded(d || 0, base);
           }
         } catch (e) { console.warn(`${MODULE_ID} | v13 prototype _refresh fallback failed`, e); }
@@ -284,7 +267,7 @@ function patchPrototypeV13() {
       };
       proto._rbrPatchedRefresh = true;
       patchedAny = true;
-      console.log(`${MODULE_ID} | v13: patched prototype via _refresh (fallback)`);
+      console.log(`${MODULE_ID} | v13: patched prototype via _refresh (fallback + cache)`);
     }
   }
 
