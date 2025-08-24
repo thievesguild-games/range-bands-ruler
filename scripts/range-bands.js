@@ -1,23 +1,25 @@
 // ============================================================================
-// Range Bands Ruler  —  v1.5.23
+// Range Bands Ruler  —  v1.5.24
 // Thieves Guild Games
 //
-// v12 + v13 support with robust distance recovery for the pill.
-// v13 strategy order:
-//  1) last segment.ray.distance (pixels -> scene units)
-//  2) sum of segments if available
-//  3) origin/first waypoint  -> ctx.position (pixels -> scene units)
-//  4) logs deep debug if still 0 to show what's missing
+// v12 + v13 support. For v13 we:
+//   • Compute one distance from segments/waypoints (pixels → scene units)
+//   • Round once and set ctx.distance to that value
+//   • Choose the band from the same rounded value (no desync)
+//   • Append band to the pill units: "m • Near" (or just "Near" if numeric hidden)
 //
 // Settings:
-//   - bands (world, JSON of {label,min,max})
+//   - bands (world, JSON of {label,min,max} in scene units)
 //   - showNumericFallback (client)
 //   - hideBracketDistances (client)
 //   - bandWhenSnappedOnly (client)
+//
+// Debugging:
+//   - DEBUG_RBR = true logs d/units/band each move.
 // ============================================================================
 
 const MODULE_ID = "range-bands-ruler";
-const DEBUG_RBR = true; // keep on for now
+const DEBUG_RBR = true; // keep on while verifying
 
 const gp = (obj, path) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(obj, path) : undefined);
 
@@ -76,19 +78,13 @@ function getBands() {
   return DEFAULT_BANDS;
 }
 
+/** Gap-safe band selection (fills gaps toward the *earlier* band). */
 function bandFor(d) {
   const EPS = 1e-6;
   const arr = getBands().slice().sort((a, b) => a.max - b.max);
   if (!arr.length) return `${d}`;
-  // Clamp below first band
   if (d < arr[0].min - EPS) return arr[0].label;
-  // Choose first band whose max bounds d (fills gaps toward earlier band)
   for (const b of arr) if (d <= b.max + EPS) return b.label;
-  // Otherwise clamp to top band
-  return arr[arr.length - 1].label;
-}
-
-  // Otherwise clamp to the highest band
   return arr[arr.length - 1].label;
 }
 
@@ -124,32 +120,25 @@ function getSceneUnits() {
 
 /* ---------------- Distance recovery (v13) ---------------- */
 
-/** Normalize anything iterable/array-like into a simple array of points with x/y. */
 function toPointArray(maybe) {
   if (!maybe) return [];
   if (Array.isArray(maybe)) return maybe;
-  try {
-    if (typeof maybe[Symbol.iterator] === "function") return Array.from(maybe);
-  } catch {}
-  // PIXI containers with children?
+  try { if (typeof maybe[Symbol.iterator] === "function") return Array.from(maybe); } catch {}
   if (maybe.children && Array.isArray(maybe.children)) return maybe.children;
   return [];
 }
 
-/** Try several strategies to get the current distance in scene units. */
 function computeLiveDistanceV13(ruler, ctxPosition) {
   const dim = canvas?.dimensions;
   if (!dim) return 0;
   const upp = (dim.distance ?? 1) / (dim.size ?? 1);
 
-  // A) last segment’s ray.distance (pixels)
+  // Prefer last segment's ray.distance (pixels)
   const segs = ruler?.segments;
   if (Array.isArray(segs) && segs.length) {
     const last = segs[segs.length - 1];
-    if (last?.ray?.distance != null) {
-      return last.ray.distance * upp;
-    }
-    // or sum up any numeric distances we find
+    if (last?.ray?.distance != null) return last.ray.distance * upp;
+
     let sum = 0;
     for (const s of segs) {
       if (s?.ray?.distance != null) sum += s.ray.distance * upp;
@@ -158,14 +147,12 @@ function computeLiveDistanceV13(ruler, ctxPosition) {
     if (sum > 0) return sum;
   }
 
-  // B) Use origin/first waypoint to current ctx.position
+  // Fallback: origin/first waypoint → ctx.position
   const wps = toPointArray(ruler?.waypoints);
-  let start = wps.length ? wps[0] : null;
-  if (!start) start = ruler?.origin || ruler?._origin || ruler?._from || null;
-
+  let start = wps.length ? wps[0] : (ruler?.origin || ruler?._origin || ruler?._from || null);
   const end = ctxPosition || ruler?._to || ruler?.destination || null;
 
-  if (start && end && (end.x != null) && (end.y != null) && (start.x != null) && (start.y != null)) {
+  if (start && end && start.x != null && start.y != null && end.x != null && end.y != null) {
     const dx = end.x - start.x;
     const dy = end.y - start.y;
     const pixels = Math.hypot(dx, dy);
@@ -173,19 +160,15 @@ function computeLiveDistanceV13(ruler, ctxPosition) {
   }
 
   if (DEBUG_RBR) {
-    console.log(`[${MODULE_ID}] DEBUG: could not compute distance. segs=`,
-      { count: Array.isArray(segs) ? segs.length : typeof segs, lastRay: segs?.at?.(-1)?.ray },
-      " waypoints=", { type: typeof ruler?.waypoints, len: toPointArray(ruler?.waypoints).length },
-      " start=", start, " end(ctx.position)=", ctxPosition);
+    console.log(`[${MODULE_ID}] DEBUG: could not compute distance.`,
+      { segs: Array.isArray(segs) ? segs.length : typeof segs,
+        lastRay: segs?.at?.(-1)?.ray,
+        wpsType: typeof ruler?.waypoints,
+        wpsLen: toPointArray(ruler?.waypoints).length,
+        start,
+        end: ctxPosition });
   }
   return 0;
-}
-
-function makeBandedText(distance, baseText) {
-  const band = bandFor(distance);
-  const base = cleanBase(baseText);
-  if (!game.settings.get(MODULE_ID, "showNumericFallback")) return band;
-  return `${band} (${base})`;
 }
 
 /* ---------------- v12 patches (instance) ---------------- */
@@ -209,7 +192,7 @@ function postProcessLabelsV12(ruler) {
     let base = stripBandWrappers(lab.text);
     base = cleanBase(base);
     const d = (segDist ?? parseNum(base)) || 0;
-    lab.text = makeBandedText(d, base);
+    lab.text = `${bandFor(d)} (${base})`;
   };
 
   if (nodes.length && segs.length && nodes.length === segs.length) {
@@ -275,25 +258,25 @@ function patchPrototypeV13() {
       const ctx = orig.apply(this, args);
       try {
         if (!ctx || !shouldBand(this)) return ctx;
-    
-        // Always compute once, then round once, and use the same number everywhere.
-        let d = computeLiveDistanceV13(this, ctx.position);
-        const dRounded = Number(d.toFixed(2));   // match pill style
+
+        // Compute ONCE and round ONCE; use this value everywhere
+        const raw = computeLiveDistanceV13(this, ctx.position);
+        const dRounded = Number((raw ?? 0).toFixed(2));
         const units = getSceneUnits();
-    
-        // Keep the pill’s numeric in sync with the band decision
+
+        // Keep the pill numeric in sync with the band decision
         ctx.distance = dRounded;
-    
+
         const band = bandFor(dRounded);
         if (DEBUG_RBR) console.log(`[${MODULE_ID}] d=${dRounded} units=${units} band=${band}`);
-    
+
         if (game.settings.get(MODULE_ID, "showNumericFallback")) {
-          ctx.units = units ? `${units} • ${band}` : band;   // e.g. "4.94 m • Melee"
+          ctx.units = units ? `${units} • ${band}` : band; // e.g., "4.92 m • Close"
         } else {
           ctx.units = band;
-          ctx.distance = "";                                 // show only the band text
+          ctx.distance = ""; // show only the band text
         }
-    
+
         if (game.settings.get(MODULE_ID, "hideBracketDistances") && typeof ctx.units === "string") {
           ctx.units = ctx.units.replace(/\[.*?\]/g, "").trim();
         }
@@ -319,7 +302,7 @@ function patchPrototypeV13() {
           if (!lab || typeof lab.text !== "string") continue;
           const base = cleanBase(stripBandWrappers(lab.text));
           const d    = parseNum(base);
-          lab.text   = makeBandedText(d || 0, base);
+          lab.text   = `${bandFor(d || 0)} (${base})`;
         }
       } catch (e) { console.warn(`${MODULE_ID} | v13 _refresh fallback failed`, e); }
       return out;
