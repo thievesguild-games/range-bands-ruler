@@ -1,7 +1,7 @@
-// Range Bands Ruler — v1.5.2
+// Range Bands Ruler — v1.5.3
 // v12: instance post-process (tooltips/measure)
-// v13+: prototype formatter patch (formatDistance/*Measurement*) with fallback to instance post-process
-// No hard dependency on libWrapper (works with or without it).
+// v13+: try prototype formatters; else instance post-process; else MutationObserver
+// No hard dependency on libWrapper.
 
 const MODULE_ID = "range-bands-ruler";
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
@@ -78,8 +78,6 @@ function makeBandedLabel(distance, baseText) {
   if (!game.settings.get(MODULE_ID, "showNumericFallback")) return bandFor(distance);
   return `${bandFor(distance)} (${base})`;
 }
-
-/* ---------- v12: label post-process on the live ruler instance ---------- */
 function getLabelNodes(ctx) {
   if (Array.isArray(ctx?.labels)) return ctx.labels;
   if (ctx?.labels?.children && Array.isArray(ctx.labels.children)) return ctx.labels.children;
@@ -96,12 +94,12 @@ function stripBandWrappers(text) {
   }
   return t.trim();
 }
+
+/* ---------- v12: label post-process on the live ruler instance ---------- */
 function postProcessLabels_v12(ctx) {
   if (!shouldBand(ctx)) return;
-
-  const labelNodes = getLabelNodes(ctx);
-  const segs = Array.isArray(ctx?.segments) ? ctx.segments : [];
-
+  const nodes = getLabelNodes(ctx);
+  const segs  = Array.isArray(ctx?.segments) ? ctx.segments : [];
   const apply = (lab, segDist) => {
     if (!lab || typeof lab.text !== "string") return;
     let base = stripBandWrappers(lab.text);
@@ -109,16 +107,14 @@ function postProcessLabels_v12(ctx) {
     const d = (segDist ?? parseNum(base)) || 0;
     lab.text = makeBandedLabel(d, base);
   };
-
-  if (labelNodes.length && segs.length && labelNodes.length === segs.length) {
-    for (let i = 0; i < labelNodes.length; i++) apply(labelNodes[i], segs[i]?.distance);
+  if (nodes.length && segs.length && nodes.length === segs.length) {
+    for (let i = 0; i < nodes.length; i++) apply(nodes[i], segs[i]?.distance);
   } else {
-    for (const lab of labelNodes) apply(lab, undefined);
+    for (const lab of nodes) apply(lab, undefined);
   }
 }
-function patchRulerInstance_v12(ruler) {
+function patchInstance_v12(ruler) {
   if (!ruler) return false;
-
   if (typeof ruler._refreshTooltips === "function" && !ruler._rbrPatchedTooltips) {
     const orig = ruler._refreshTooltips.bind(ruler);
     ruler._refreshTooltips = function (...args) {
@@ -127,10 +123,9 @@ function patchRulerInstance_v12(ruler) {
       return out;
     };
     ruler._rbrPatchedTooltips = true;
-    console.log(`${MODULE_ID} | Patched v12 instance via _refreshTooltips`);
+    console.log(`${MODULE_ID} | v12: patched via _refreshTooltips`);
     return true;
   }
-
   if (typeof ruler.measure === "function" && !ruler._rbrPatchedMeasure) {
     const orig = ruler.measure.bind(ruler);
     ruler.measure = function (...args) {
@@ -139,11 +134,10 @@ function patchRulerInstance_v12(ruler) {
       return out;
     };
     ruler._rbrPatchedMeasure = true;
-    console.log(`${MODULE_ID} | Patched v12 instance via measure`);
+    console.log(`${MODULE_ID} | v12: patched via measure`);
     return true;
   }
-
-  console.warn(`${MODULE_ID} | v12: Could not find a method to patch on this ruler instance.`);
+  console.warn(`${MODULE_ID} | v12: no instance method to patch`);
   return false;
 }
 function tryPatchCurrentRuler_v12() {
@@ -152,43 +146,112 @@ function tryPatchCurrentRuler_v12() {
     gp(canvas, "hud.ruler") ||
     game.ruler ||
     gp(ui, "controls.controls.ruler");
-  if (r) patchRulerInstance_v12(r);
+  if (r) patchInstance_v12(r);
 }
 
-/* ---------- v13+: patch the formatter on the class prototype ---------- */
+/* ---------- v13+: patch the formatter on the class prototype, or fallback ---------- */
 function patchPrototype_v13() {
   const RulerClass =
     gp(foundry, "canvas.interaction.Ruler") ||     // canonical in v13
     gp(CONFIG, "Canvas.rulerClass") ||
-    globalThis.Ruler;                               // deprecated global
+    globalThis.Ruler;
 
   if (!RulerClass) {
     console.warn(`${MODULE_ID} | v13: No Ruler class found to patch.`);
     return false;
   }
-
   const proto = RulerClass.prototype;
-  const fmtName = ["_formatDistance", "formatDistance", "_formatMeasurement", "formatMeasurement"]
-    .find(n => typeof proto?.[n] === "function");
 
-  if (!fmtName) {
-    console.warn(`${MODULE_ID} | v13: Missing Ruler.prototype._/format(Distance|Measurement).`);
-    return false;
+  // Try a bunch of likely formatter names
+  const candidates = [
+    "_formatDistance", "formatDistance",
+    "_formatMeasurement", "formatMeasurement",
+    "_formatValue", "formatValue"
+  ];
+  const fmt = candidates.find(n => typeof proto?.[n] === "function");
+
+  if (fmt) {
+    if (proto._rbrPatchedFormatName === fmt) return true;
+    const original = proto[fmt];
+    proto[fmt] = function (distance, ...rest) {
+      const base = original.call(this, distance, ...rest);      // e.g. "60 ft [60 ft]"
+      if (!shouldBand(this)) return base;
+      const d = typeof distance === "number" ? distance : parseNum(base);
+      return makeBandedLabel(d, base);
+    };
+    proto._rbrPatchedFormatName = fmt;
+    console.log(`${MODULE_ID} | v13: patched prototype via ${fmt}`);
+    return true;
   }
 
-  if (proto._rbrPatchedFormatName === fmtName) return true; // already patched
+  console.warn(`${MODULE_ID} | v13: formatter not found on prototype. Falling back to instance patch.`);
+  return false;
+}
 
-  const original = proto[fmtName];
-  proto[fmtName] = function (distance, ...rest) {
-    const base = original.call(this, distance, ...rest);  // e.g., "60 ft [60 ft]"
-    if (!shouldBand(this)) return base;
-    const d = typeof distance === "number" ? distance : parseNum(base);
-    return makeBandedLabel(d, base);
-  };
-  proto._rbrPatchedFormatName = fmtName;
+function patchInstance_v13(ruler) {
+  if (!ruler) return false;
 
-  console.log(`${MODULE_ID} | v13: Patched prototype via ${fmtName}`);
-  return true;
+  // Try a wide set of update/refresh methods on the instance
+  const tryNames = [
+    "_refreshTooltips","refreshTooltips","_updateTooltips","updateTooltips",
+    "_refreshLabels","refreshLabels","_updateLabels","updateLabels",
+    "_refresh","refresh","_render","render","_draw","draw","_measure","measure"
+  ];
+  for (const name of tryNames) {
+    const fn = ruler[name];
+    if (typeof fn === "function" && !ruler._rbrPatchedName) {
+      const orig = fn.bind(ruler);
+      ruler[name] = function (...args) {
+        const out = orig(...args);
+        try { // rewrite labels after the tool updates
+          const nodes = getLabelNodes(this);
+          if (nodes.length) {
+            // emulate v12 path: use text + (if present) segments
+            const segs = Array.isArray(this?.segments) ? this.segments : [];
+            const apply = (lab, segDist) => {
+              if (!lab || typeof lab.text !== "string") return;
+              let base = stripBandWrappers(lab.text);
+              base = cleanBaseText(base);
+              const d = (segDist ?? parseNum(base)) || 0;
+              lab.text = makeBandedLabel(d, base);
+            };
+            if (segs.length === nodes.length) {
+              for (let i = 0; i < nodes.length; i++) apply(nodes[i], segs[i]?.distance);
+            } else {
+              for (const lab of nodes) apply(lab, undefined);
+            }
+          }
+        } catch (e) { console.warn(`${MODULE_ID} | v13 instance fallback failed`, e); }
+        return out;
+      };
+      ruler._rbrPatchedName = name;
+      console.log(`${MODULE_ID} | v13: patched instance via ${name}`);
+      return true;
+    }
+  }
+
+  // Last resort: observe label container and rewrite on mutation
+  const container = gp(ruler, "labels") || gp(ruler, "tooltips");
+  if (container?.children && typeof MutationObserver !== "undefined" && !ruler._rbrObserver) {
+    const obs = new MutationObserver(() => {
+      try {
+        const nodes = getLabelNodes(ruler);
+        for (const lab of nodes) {
+          if (!lab || typeof lab.text !== "string") continue;
+          const base = cleanBaseText(stripBandWrappers(lab.text));
+          const d = parseNum(base);
+          lab.text = makeBandedLabel(d, base);
+        }
+      } catch (e) { /* ignore */ }
+    });
+    obs.observe(container, { childList: true, subtree: true, characterData: true });
+    ruler._rbrObserver = obs;
+    console.log(`${MODULE_ID} | v13: observing labels with MutationObserver`);
+    return true;
+  }
+
+  console.warn(`${MODULE_ID} | v13: no instance method to patch`);
+  return false;
 }
 
 /* ---------- lifecycle ---------- */
@@ -197,9 +260,23 @@ function isV13Plus() {
   return Number.isFinite(gen) ? gen >= 13 : (Number(gp(game, "version")?.split?.(".")?.[0]) >= 13);
 }
 
+function tryPatch_v13() {
+  const okProto = patchPrototype_v13();
+  if (okProto) return true;
+
+  // fallback to instance patch
+  const r =
+    gp(canvas, "controls.ruler") ||
+    gp(canvas, "hud.ruler") ||
+    game.ruler ||
+    gp(ui, "controls.controls.ruler");
+  if (r) return patchInstance_v13(r);
+  return false;
+}
+
 Hooks.on("canvasReady", () => {
   if (isV13Plus()) {
-    patchPrototype_v13();
+    tryPatch_v13();
   } else {
     console.log(`${MODULE_ID} | canvasReady — attempting v12 instance patch`);
     tryPatchCurrentRuler_v12();
@@ -208,7 +285,7 @@ Hooks.on("canvasReady", () => {
 
 Hooks.once("ready", () => {
   if (isV13Plus()) {
-    patchPrototype_v13();
+    tryPatch_v13();
   } else {
     tryPatchCurrentRuler_v12();
   }
