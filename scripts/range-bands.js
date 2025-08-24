@@ -1,6 +1,7 @@
-// Range Bands Ruler — v1.5.11
-// v12: instance post-process of label text
-// v13: append band to pill units (distance stays numeric) + style/fallback patches
+// Range Bands Ruler — v1.5.12
+// Works with Foundry v12 and v13
+// v12: post-process label text after measurement
+// v13: keep distance numeric; append band to units from scene; style/fallback patches
 
 const MODULE_ID = "range-bands-ruler";
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
@@ -159,7 +160,7 @@ function patchPrototypeV13() {
   for (const proto of getRulerProtos()) {
     if (!proto) continue;
 
-    // Preferred: rewrite pill by appending band to units (distance stays numeric)
+    // Preferred: modify waypoint context for the HTML pill
     if (typeof proto._getWaypointLabelContext === "function" && !proto._rbrPatchedWLC) {
       const orig = proto._getWaypointLabelContext;
       proto._getWaypointLabelContext = function (...args) {
@@ -167,20 +168,23 @@ function patchPrototypeV13() {
         try {
           if (!ctx || !shouldBand(this)) return ctx;
 
+          // Keep distance numeric for the pill
           const dNum = typeof ctx.distance === "number"
             ? ctx.distance
             : (typeof args?.[0]?.distance === "number" ? args[0].distance : parseNum(String(ctx.distance)));
 
-          const base = cleanBase(`${dNum} ${ctx.units ?? ""}`.trim());
+          // Always start from scene units (plain), never reuse ctx.units (can persist formatted text)
+          const sceneUnits = String(canvas?.scene?.grid?.units ?? ctx.units ?? "").trim();
           const band = bandFor(dNum);
 
           if (game.settings.get(MODULE_ID, "showNumericFallback")) {
-            const dot = ctx.units ? " • " : " ";
-            ctx.units = `${ctx.units ?? ""}${dot}${band}`.trim(); // "4.2 m • Near"
+            // Show "14.5 m • Near"
+            ctx.units = sceneUnits ? `${sceneUnits} • ${band}` : band;
             // ctx.distance remains numeric
           } else {
-            ctx.units = band;   // "Near"
-            ctx.distance = "";  // print just "Near"
+            // Show just "Near"
+            ctx.units = band;
+            ctx.distance = ""; // only prints units string in the pill
           }
 
           if (game.settings.get(MODULE_ID, "hideBracketDistances") && typeof ctx.units === "string") {
@@ -193,7 +197,7 @@ function patchPrototypeV13() {
       };
       proto._rbrPatchedWLC = true;
       patchedAny = true;
-      console.log(`${MODULE_ID} | v13: patched _getWaypointLabelContext (units += band; distance numeric)`);
+      console.log(`${MODULE_ID} | v13: patched _getWaypointLabelContext (units from scene + band)`);
     }
 
     // Style-level safety net (some systems compose label text here)
@@ -217,7 +221,7 @@ function patchPrototypeV13() {
       console.log(`${MODULE_ID} | v13: patched prototype via _getSegmentStyle`);
     }
 
-    // Last-resort fallback: rewrite any PIXI label nodes after refresh
+    // Last-resort: rewrite PIXI label nodes after refresh
     if (typeof proto._refresh === "function" && !proto._rbrPatchedRefresh) {
       const orig = proto._refresh;
       proto._refresh = function (...args) {
