@@ -217,24 +217,32 @@ function rbrPatchPrototypeV13() {
     };
 
     // ---- Patch _getWaypointLabelContext (preferred) ----
-    if (typeof proto._getWaypointLabelContext === "function" && !flags.wlc) {
-      const orig = proto._getWaypointLabelContext;
-      proto._getWaypointLabelContext = function (...args) {
-        const ctx = orig.apply(this, args);
-        try {
-          if (!rbrShouldBand(this)) return ctx;
-          // distance may be args[0]?.distance on some builds
-          const argDist = typeof args?.[0]?.distance === "number" ? args[0].distance : undefined;
-          return applyToContext(ctx, argDist);
-        } catch (e) {
-          console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext patch failed`, e);
-          return ctx;
-        }
-      };
-      flags.wlc = true;
-      patchedAny = true;
-      console.log(`${MODULE_ID} | v13: patched prototype via _getWaypointLabelContext`);
+    if (typeof proto._getWaypointLabelContext === "function") {
+  const orig = proto._getWaypointLabelContext;
+  proto._getWaypointLabelContext = function (...args) {
+    const ctx = orig.apply(this, args);
+    try {
+      if (!ctx || !rbrShouldBand(this)) return ctx;
+
+      // v13 gives us structured fields (no 'text'). Build a base like "60 ft".
+      const dNum = typeof ctx.distance === "number" ? ctx.distance
+                 : (typeof args?.[0]?.distance === "number" ? args[0].distance : rbrParseNum(String(ctx.distance)));
+      const base = rbrCleanBase(`${dNum} ${ctx.units ?? ""}`.trim());
+
+      // Build the final banded string we want to display
+      const banded = rbrMakeLabel(dNum || 0, base);
+
+      // Overwrite the context so the template prints our single string
+      ctx.distance = banded;  // becomes the full label
+      ctx.units = "";         // avoid "banded ft"
+    } catch (e) {
+      console.warn(`${MODULE_ID} | v13 _getWaypointLabelContext patch failed`, e);
     }
+    return ctx;
+  };
+  console.log(`${MODULE_ID} | v13: patched prototype via _getWaypointLabelContext (ctx.distance override)`);
+  patched = true;
+}
 
     // ---- Patch _getSegmentStyle too (to avoid later overwrite) ----
     if (typeof proto._getSegmentStyle === "function" && !flags.seg) {
