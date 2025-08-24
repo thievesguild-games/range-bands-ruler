@@ -1,9 +1,9 @@
-// Range Bands Ruler — v1.5.13
+// Range Bands Ruler — v1.5.14
 // Works on Foundry v12 & v13
 
 const MODULE_ID = "range-bands-ruler";
 // Flip to true to log distances/bands while testing v13
-const DEBUG_RBR = false;
+const DEBUG_RBR = true;
 
 const gp = (o, p) => (foundry?.utils?.getProperty ? foundry.utils.getProperty(o, p) : undefined);
 
